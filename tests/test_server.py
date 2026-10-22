@@ -75,6 +75,9 @@ def test_project_flow_to_training_and_export(env):
 	examples.append({"input": "bad", "output": {"label": "nope"}})
 	data = client.put(f"/api/projects/{pid}/examples", json={"examples": examples}).json()
 	assert len(data["invalid"]) == 1
+	label_counts = {v["value"]: v["count"] for v in data["stats"]["fields"][0]["values"]}
+	assert label_counts == {"billing": 6, "technical": 6, "account": 0, "other": 0}
+	assert data["stats"]["duplicates"] == []
 
 	res = client.post(f"/api/projects/{pid}/runs")
 	assert res.status_code == 400
@@ -98,12 +101,34 @@ def test_project_flow_to_training_and_export(env):
 	detail = client.get(f"/api/projects/{pid}/runs/{run_id}").json()
 	assert detail["status"]["state"] == "queued"
 	assert detail["events"] == []
+	assert detail["evaluation"] is None
+
+	items = [{"input": "x", "expected": {"label": "billing"}, "generated": '{"label":"technical"}'}]
+	write_json(run_dir / "eval.json", {"count": 1, "exact_match": 0.0, "items": items})
+	labels = client.get(f"/api/projects/{pid}/runs/{run_id}").json()["evaluation"]["labels"]
+	assert labels[0]["confusions"] == [{"expected": "billing", "predicted": "technical", "unknown": False, "count": 1}]
+	(run_dir / "eval.json").unlink()
 
 	res = client.post(f"/api/projects/{pid}/runs/{run_id}/export", json={"gguf": "q8_0"})
 	assert res.status_code == 400
+	res = client.post(f"/api/projects/{pid}/runs/{run_id}/predict", json={"inputs": ["hello"]})
+	assert res.status_code == 400 and "completed" in res.json()["detail"]
 
 	write_json(run_dir / "status.json", {"state": "completed"})
 	(run_dir / "adapter").mkdir()
+
+	for bad in ({"inputs": []}, {"inputs": ["  "]}, {"inputs": "hello"}, {"inputs": ["x"] * 11}):
+		assert client.post(f"/api/projects/{pid}/runs/{run_id}/predict", json=bad).status_code == 400, bad
+	write_json(run_dir / "predict" / "result.json", {"items": ["stale"]})
+	res = client.post(f"/api/projects/{pid}/runs/{run_id}/predict", json={"inputs": ["My card was charged twice"]})
+	assert res.status_code == 200, res.text
+	assert jobs.started[-1][0] == "predict"
+	assert read_json(run_dir / "predict" / "request.json") == {"inputs": ["My card was charged twice"]}
+	predict = client.get(f"/api/projects/{pid}/runs/{run_id}?items=false").json()["predict"]
+	assert predict["status"]["state"] == "queued" and predict["result"] is None
+	write_json(run_dir / "predict" / "result.json", {"items": [{"input": "x", "value": {"label": "billing"}}]})
+	predict = client.get(f"/api/projects/{pid}/runs/{run_id}").json()["predict"]
+	assert predict["result"]["items"][0]["value"] == {"label": "billing"}
 	res = client.post(f"/api/projects/{pid}/runs/{run_id}/export", json={"gguf": "q4_k_m", "ollama_name": "Bad Name"})
 	assert res.status_code == 400
 	res = client.post(f"/api/projects/{pid}/runs/{run_id}/export", json={"gguf": "q4_k_m", "ollama": True})
@@ -129,7 +154,9 @@ def test_import_and_infer_schema(env):
 	schema = client.post(f"/api/projects/{pid}/infer-schema").json()["schema"]
 	assert schema["properties"]["label"]["enum"] == ["greeting", "farewell"]
 	client.put(f"/api/projects/{pid}", json={"config": {"schema": schema}})
-	assert client.get(f"/api/projects/{pid}/examples").json()["invalid"] == []
+	data = client.get(f"/api/projects/{pid}/examples").json()
+	assert data["invalid"] == []
+	assert data["stats"]["fields"][0]["values"] == [{"value": "greeting", "count": 2}, {"value": "farewell", "count": 2}]
 
 
 def test_settings_never_return_token(env):

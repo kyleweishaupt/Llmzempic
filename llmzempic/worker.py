@@ -1,4 +1,4 @@
-"""Child-process entry point: python -m llmzempic.worker {train|export} <run dir>."""
+"""Child-process entry point: python -m llmzempic.worker {train|export|predict} <run dir>."""
 
 import sys
 import traceback
@@ -18,6 +18,9 @@ def run(kind, run_dir):
 		elif kind == "export":
 			from .exporter import run_export
 			run_export(run_dir, status)
+		elif kind == "predict":
+			from .predictor import run_prediction
+			run_prediction(run_dir, status)
 		else:
 			raise ValueError(f"Unknown job kind: {kind}")
 	except KeyboardInterrupt:
@@ -33,7 +36,7 @@ def run(kind, run_dir):
 def main(argv=None):
 	argv = sys.argv[1:] if argv is None else argv
 	if len(argv) != 2:
-		print("usage: python -m llmzempic.worker {train|export} <run dir>", file=sys.stderr)
+		print("usage: python -m llmzempic.worker {train|export|predict} <run dir>", file=sys.stderr)
 		return 2
 	return run(argv[0], argv[1])
 

@@ -41,12 +41,18 @@ then `pip install -e .[train,cuda]`.
 		output field, typed using the schema
 
 	Every output is validated against the schema; training won't start until they all match.
-	20 examples is a minimum, 100-500 covering every label and edge case is better.
+	20 examples is a minimum, 100-500 covering every label and edge case is better. The tab counts
+	examples per label (enum, boolean and tag fields) and flags labels with no examples and inputs
+	that appear more than once, especially copies with different outputs.
 3. **Model** - pick a base model. Each one shows whether it fits your GPU. Bigger is smarter but
 	slower to train and run. Any Hugging Face model id or local folder works too.
 4. **Train** - presets (Quick / Balanced / Thorough) or advanced settings. Live loss chart and log.
 	When training ends the model is scored on held-out examples: valid JSON, matches schema, and
-	exact match, with per-example predictions.
+	exact match, with per-example predictions. Held-out examples are picked in proportion for each
+	value of the first enum or boolean field, and copies of an input stay on the same side. Enum,
+	boolean and tag fields also get a per-label breakdown (how often each value is recognized,
+	precision) and the most common mix-ups. **Try it** runs a finished model on your own input;
+	"Add as example" turns the answer into a new example to correct, so mistakes feed the next run.
 5. **Export** - creates a GGUF model (Q8_0 by default), an Ollama `Modelfile`, the schema, the
 	exact system prompt, a manifest, and client code. Optionally registers it with Ollama.
 
@@ -83,6 +89,7 @@ schema-valid JSON. Fine-tuning makes the *content* right; constrained decoding g
 llmzempic                         # web UI (same as `llmzempic ui`)
 llmzempic ui --port 8000 --no-browser
 llmzempic train <project>         # train without the UI
+llmzempic try <run folder> "text" # answer an input with a trained run
 llmzempic export <run folder> --gguf q4_k_m --ollama
 llmzempic doctor                  # detected GPU, memory and libraries
 ```

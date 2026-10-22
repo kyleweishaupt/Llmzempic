@@ -13,12 +13,14 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, hardware
 from .data import parse_examples
+from .dataset import dataset_stats
 from .fileio import read_json, tail_text
 from .jobs import JobBusy, JobManager, job_paths, mark_interrupted
+from .metrics import label_breakdown
 from .prompts import build_system_prompt
 from .runs import (
-	GGUF_TYPES, RunError, create_run, list_export_files, model_name, prepare_export, read_events,
-	run_summary, validate_examples,
+	GGUF_TYPES, RunError, create_run, list_export_files, model_name, prepare_export, prepare_prediction,
+	read_events, run_summary, validate_examples,
 )
 from .schema_tools import TEMPLATES, check_schema, infer_schema
 from .snippets import all_snippets
@@ -93,6 +95,7 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		return {
 			"examples": examples,
 			"invalid": validate_examples(examples, config["schema"]),
+			"stats": dataset_stats(examples, config["schema"]),
 			"warnings": warnings or [],
 		}
 
@@ -237,11 +240,19 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		project = project_or_404(project_id)
 		run_dir = run_or_404(project, run_id)
 		evaluation = read_json(run_dir / "eval.json", None) if items else None
+		if evaluation and evaluation.get("items"):
+			schema = (read_json(run_dir / "run.json", {}) or {}).get("schema")
+			evaluation["labels"] = label_breakdown(evaluation["items"], schema)
 		return {
 			**run_summary(run_dir),
 			"events": read_events(run_dir, since),
 			"log": tail_text(job_paths("train", run_dir)[1]),
 			"export_log": tail_text(job_paths("export", run_dir)[1]),
+			"predict": {
+				"status": read_json(run_dir / "predict" / "status.json", None),
+				"result": read_json(run_dir / "predict" / "result.json", None),
+				"log": tail_text(job_paths("predict", run_dir)[1]),
+			},
 			"evaluation": evaluation,
 			"files": list_export_files(run_dir),
 			"active_job": active_job(),
@@ -278,6 +289,23 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		except JobBusy as e:
 			raise HTTPException(409, str(e))
 		return run_summary(run_dir)
+
+	@app.post("/api/projects/{project_id}/runs/{run_id}/predict")
+	def predict_run(project_id: str, run_id: str, payload: dict = Body(...)):
+		run_dir = run_or_404(project_or_404(project_id), run_id)
+		if jobs.current():
+			raise HTTPException(409, "Another job is running. Wait for it to finish or stop it.")
+		hw = hw_cache.get()
+		if not hw["can_train"]:
+			raise HTTPException(400, "Trying a model needs the training libraries (PyTorch, transformers, peft).")
+		try:
+			prepare_prediction(run_dir, payload)
+			jobs.start("predict", run_dir, job_env())
+		except RunError as e:
+			raise HTTPException(400, str(e))
+		except JobBusy as e:
+			raise HTTPException(409, str(e))
+		return {"ok": True}
 
 	@app.get("/api/projects/{project_id}/runs/{run_id}/snippets")
 	def snippets(project_id: str, run_id: str):

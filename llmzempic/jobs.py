@@ -21,7 +21,11 @@ def job_paths(kind, run_dir):
 	run_dir = Path(run_dir)
 	if kind == "train":
 		return run_dir / "status.json", run_dir / "train.log"
-	return run_dir / "export" / "status.json", run_dir / "export" / "export.log"
+	if kind == "export":
+		return run_dir / "export" / "status.json", run_dir / "export" / "export.log"
+	if kind == "predict":
+		return run_dir / "predict" / "status.json", run_dir / "predict" / "predict.log"
+	raise ValueError(f"Unknown job kind: {kind}")
 
 
 def kill_tree(proc):
@@ -135,7 +139,7 @@ def mark_interrupted(workspace):
 	"""Runs left 'running' by a previous session can't be resumed; flag them as interrupted."""
 	for project in workspace.projects():
 		for run_id in project.run_ids():
-			for kind in ("train", "export"):
+			for kind in ("train", "export", "predict"):
 				path = job_paths(kind, project.runs_dir / run_id)[0]
 				status = read_json(path, None)
 				if status and status.get("state") in ("queued", "running"):

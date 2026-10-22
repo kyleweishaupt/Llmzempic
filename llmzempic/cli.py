@@ -1,4 +1,4 @@
-"""Command line: `llmzempic` (web UI), `llmzempic train`, `llmzempic export`, `llmzempic doctor`."""
+"""Command line: `llmzempic` (web UI), `llmzempic train`, `llmzempic try`, `llmzempic export`, `llmzempic doctor`."""
 
 import argparse
 import json
@@ -32,7 +32,25 @@ def cmd_train(args):
 	print(f"Run folder: {run_dir}")
 	status = StatusFile(run_dir / "status.json")
 	run_training(run_dir, status)
-	print(json.dumps(status.data.get("metrics"), indent=2))
+	from .fileio import read_json
+	from .metrics import label_breakdown
+	evaluation = read_json(run_dir / "eval.json", None) or {}
+	spec = read_json(run_dir / "run.json", {})
+	print(json.dumps({**(status.data.get("metrics") or {}), "labels": label_breakdown(evaluation.get("items") or [], spec.get("schema"))}, indent=2))
+
+
+def cmd_try(args):
+	from pathlib import Path
+
+	from .fileio import StatusFile, read_json
+	from .runs import prepare_prediction
+
+	run_dir = Path(args.run).expanduser().resolve()
+	# Validate the run and inputs before loading PyTorch.
+	predict_dir = prepare_prediction(run_dir, {"inputs": args.inputs})
+	from .predictor import run_prediction
+	run_prediction(run_dir, StatusFile(predict_dir / "status.json"))
+	print(json.dumps(read_json(predict_dir / "result.json"), indent=2, ensure_ascii=False))
 
 
 def cmd_export(args):
@@ -77,6 +95,11 @@ def main(argv=None):
 	export.add_argument("--keep-merged", action="store_true", help="Also keep the merged safetensors model")
 	export.add_argument("--ollama", action="store_true", help="Register the model with Ollama")
 	export.set_defaults(func=cmd_export)
+
+	try_ = sub.add_parser("try", help="Answer inputs with a trained run (before exporting it)")
+	try_.add_argument("run", help="Run folder (…/projects/<id>/runs/<run>)")
+	try_.add_argument("inputs", nargs="+", help="One or more input texts")
+	try_.set_defaults(func=cmd_try)
 
 	doctor = sub.add_parser("doctor", help="Show detected hardware and libraries")
 	doctor.set_defaults(func=cmd_doctor)

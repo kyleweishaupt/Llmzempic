@@ -110,6 +110,8 @@ const S = {
 	examples: [],
 	invalid: new Map(),
 	badJson: new Map(),
+	stats: null,
+	savedSchema: "",
 	page: 0,
 	filter: "all",
 	runs: [],
@@ -120,6 +122,8 @@ const S = {
 	snippets: null,
 	snippetTab: "php",
 	logOpen: false,
+	mistakesOnly: false,
+	tryInput: "",
 };
 const PAGE_SIZE = 25;
 
@@ -138,6 +142,8 @@ function renderHeader() {
 	if (!hw.can_train) el.append(h("span", { class: "badge critical" }, " · ✕ training libraries missing"));
 }
 
+const JOB_LABEL = { train: "Training", export: "Exporting", predict: "Trying a model" };
+
 function renderJobBanner() {
 	const el = $("#job-banner");
 	el.replaceChildren();
@@ -145,10 +151,10 @@ function renderJobBanner() {
 	if (!job) return;
 	const project = S.projects.find((p) => p.id === job.project_id);
 	el.append(h("div", { class: "card" },
-		h("b", {}, job.kind === "train" ? "Training" : "Exporting"), " ",
+		h("b", {}, JOB_LABEL[job.kind] || job.kind), " ",
 		h("span", { class: "muted" }, project ? project.name : job.project_id),
 		h("div", { class: "muted" }, `running ${duration(Date.now() / 1000 - job.started)}`),
-		h("button", { class: "ghost small", type: "button", onclick: () => openProject(job.project_id, job.kind === "train" ? "train" : "export", job.run_id) }, "View"),
+		h("button", { class: "ghost small", type: "button", onclick: () => openProject(job.project_id, job.kind === "export" ? "export" : "train", job.run_id) }, "View"),
 	));
 }
 
@@ -180,6 +186,7 @@ async function openProject(pid, tab, runId) {
 		S.pid = pid;
 		S.view = view;
 		S.config = view.config;
+		S.savedSchema = JSON.stringify(view.config.schema);
 		setExamples(ex);
 		S.runs = runs.runs;
 		S.page = 0;
@@ -187,6 +194,7 @@ async function openProject(pid, tab, runId) {
 		S.run = null;
 		S.events = [];
 		S.snippets = null;
+		S.tryInput = "";
 		$("#import-warnings").replaceChildren();
 	}
 	if (runId) await selectRun(runId);
@@ -212,6 +220,11 @@ function scheduleConfigSave() {
 			S.view = view;
 			setSaveState("Saved");
 			renderSchemaStatus();
+			const schema = JSON.stringify(config.schema);
+			if (schema !== S.savedSchema) {
+				S.savedSchema = schema;
+				refreshExampleChecks(pid).catch((e) => toast(e.message, true));
+			}
 			const p = S.projects.find((x) => x.id === pid);
 			if (p && (p.name !== config.name || p.base_model !== config.base_model)) {
 				p.name = config.name;
@@ -303,7 +316,18 @@ function bindTask() {
 function setExamples(data) {
 	S.examples = data.examples;
 	S.invalid = new Map(data.invalid.map((i) => [i.id, i.errors]));
+	S.stats = data.stats;
 	S.badJson = new Map();
+}
+
+// Schema checks and label counts depend on the schema; refresh them without touching unsaved example edits.
+async function refreshExampleChecks(pid) {
+	const data = await api(`/projects/${pid}/examples`);
+	if (S.pid !== pid) return;
+	S.invalid = new Map(data.invalid.map((i) => [i.id, i.errors]));
+	S.stats = data.stats;
+	updateExampleErrors();
+	renderDatasetOverview();
 }
 
 function exampleErrors(id) {
@@ -347,7 +371,9 @@ function scheduleExamplesSave() {
 			const data = await api(`/projects/${pid}/examples`, { method: "PUT", body: { examples } });
 			if (S.pid !== pid) return;
 			S.invalid = new Map(data.invalid.map((i) => [i.id, i.errors]));
+			S.stats = data.stats;
 			updateExampleErrors();
+			renderDatasetOverview();
 		} catch (e) {
 			toast(e.message, true);
 		}
@@ -355,7 +381,50 @@ function scheduleExamplesSave() {
 }
 
 function visibleExamples() {
-	return S.filter === "invalid" ? S.examples.filter((e) => exampleErrors(e.id).length) : S.examples;
+	if (S.filter === "invalid") return S.examples.filter((e) => exampleErrors(e.id).length);
+	if (S.filter === "duplicates") {
+		// Copies of the same input are listed next to each other.
+		const byId = new Map(S.examples.map((e) => [e.id, e]));
+		return ((S.stats && S.stats.duplicates) || []).flatMap((g) => g.ids).map((id) => byId.get(id)).filter(Boolean);
+	}
+	return S.examples;
+}
+
+const labelText = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+
+function duplicateCounts() {
+	const groups = (S.stats && S.stats.duplicates) || [];
+	const conflicts = groups.filter((g) => g.conflict).length;
+	return { conflicts, plain: groups.length - conflicts };
+}
+
+function renderDatasetOverview() {
+	const stats = S.stats;
+	const el = $("#dataset-overview");
+	if (!stats || !stats.count) { el.replaceChildren(); return; }
+	const rows = stats.fields.map((f) => h("div", { class: "overview-row" },
+		h("b", {}, f.field),
+		h("span", { class: "muted" }, f.kind === "tags" ? " examples per tag" : ""),
+		h("div", { class: "chips" }, f.values.map((v) => h("span", {
+			class: "chip" + (v.count === 0 ? " critical" : v.count < 3 ? " warning" : ""),
+			title: v.count === 0 ? "No examples: the model can't learn this value" : v.count < 3 ? "Very few examples" : null,
+		}, labelText(v.value), h("span", { class: "n" }, String(v.count))))),
+	));
+	const { conflicts, plain } = duplicateCounts();
+	if (conflicts || plain) {
+		rows.push(h("div", { class: "overview-row" },
+			h("span", { class: `badge ${conflicts ? "critical" : "warning"}` },
+				`${conflicts + plain} input(s) appear more than once` + (conflicts ? `, ${conflicts} with different expected outputs` : "")),
+			" ",
+			h("button", { class: "ghost small", type: "button", onclick: () => {
+				S.filter = "duplicates";
+				$("#examples-filter").value = "duplicates";
+				S.page = 0;
+				renderExamples();
+			} }, "Show them"),
+		));
+	}
+	el.replaceChildren(...(rows.length ? [h("div", { class: "card overview" }, rows)] : []));
 }
 
 function renderExamples() {
@@ -367,6 +436,7 @@ function renderExamples() {
 	if (!S.examples.length) {
 		$("#examples-list").append(h("div", { class: "card muted" }, "No examples yet. Add a few by hand or import a file. Aim for at least 20; 100+ covering every label and edge case is better."));
 	}
+	renderDatasetOverview();
 	$("#examples-pager").replaceChildren(
 		pages > 1 ? h("button", { class: "ghost small", type: "button", disabled: S.page === 0, onclick: () => { S.page--; renderExamples(); } }, "‹ Prev") : null,
 		pages > 1 ? h("span", { class: "muted" }, `Page ${S.page + 1} of ${pages}`) : null,
@@ -613,6 +683,15 @@ function readiness() {
 	const warnings = [];
 	if (n >= 2 && n < 20) warnings.push("Fewer than 20 examples: results will be unreliable. 100+ is better.");
 	if (n >= 2 && n < 10) warnings.push("With fewer than 10 examples, scoring uses training examples (no held-out set).");
+	if (n >= 2 && S.stats) {
+		for (const f of S.stats.fields) {
+			const unseen = f.values.filter((v) => v.count === 0).map((v) => labelText(v.value));
+			if (unseen.length) warnings.push(`${f.field}: no examples of ${unseen.join(", ")}. The model can't learn a value it never sees.`);
+		}
+		const { conflicts, plain } = duplicateCounts();
+		if (conflicts) warnings.push(`${conflicts} input(s) appear more than once with different expected outputs; the model can't learn both answers.`);
+		if (plain) warnings.push(`${plain} input(s) appear more than once. Copies stay together when examples are held out, but each copy counts extra in training.`);
+	}
 	if (hw && hw.device !== "cuda") warnings.push("No GPU: training will be slow for models above ~0.5B parameters.");
 	return { ok: checks.every((c) => c[0]), checks, warnings };
 }
@@ -641,7 +720,8 @@ function renderRunsTable() {
 			class: "selectable" + (run.id === S.runId ? " selected" : ""),
 			onclick: async () => { await selectRun(run.id); renderTrain(); },
 		},
-			h("td", {}, run.id, h("span", { class: "sub" }, `${run.train_count} train / ${run.eval_count} held out`)),
+			h("td", {}, run.id, h("span", { class: "sub" }, `${run.train_count} train / ${run.eval_count} held out` +
+				(run.eval_count && run.split && run.split.stratified_by ? ` · balanced by ${run.split.stratified_by}` : ""))),
 			h("td", {}, run.base_model),
 			h("td", {}, stateBadge(run.status), h("span", { class: "sub" }, run.status.state === "running" ? run.status.stage : "")),
 			h("td", { class: "num" }, pct(run.metrics && run.metrics.schema_valid)),
@@ -689,6 +769,7 @@ function renderRunDetail() {
 	if (ev) parts.push(evaluationView(ev));
 	else if (run.metrics) parts.push(metricTiles(run.metrics));
 	if (st.state === "completed") {
+		parts.push(tryPanel(run));
 		parts.push(h("button", { type: "button", onclick: () => showTab("export") }, "Export this model →"));
 	}
 	const details = h("details", { open: S.logOpen || running }, h("summary", {}, "Training log"), h("pre", { class: "code-block log" }, run.log || "(empty)"));
@@ -697,6 +778,68 @@ function renderRunDetail() {
 	el.replaceChildren(...parts);
 	const log = $(".log", el);
 	log.scrollTop = log.scrollHeight;
+}
+
+// ---------- try a trained run ----------
+
+function tryPanel(run) {
+	const pr = run.predict || {};
+	const pst = pr.status;
+	const job = S.system && S.system.active_job;
+	const mine = Boolean(job && job.kind === "predict" && job.run_id === run.id);
+	const input = h("textarea", { rows: 4, value: S.tryInput, placeholder: "Paste an input the model hasn't seen…" });
+	input.addEventListener("input", () => (S.tryInput = input.value));
+	const parts = [
+		h("h3", {}, "Try it"),
+		h("p", { class: "hint" }, "Run this model on your own input before exporting it. Each try loads the model first, so an answer can take a minute."),
+		input,
+		h("div", { class: "row" },
+			h("button", { type: "button", disabled: Boolean(job), onclick: () => tryModel(run.id) }, mine ? "Running…" : "Run"),
+			mine ? h("button", { class: "ghost danger", type: "button", onclick: () => stopRun(run.id) }, "Stop") : null,
+			h("span", { class: "muted" }, mine ? (pst && pst.stage) || "Starting" : job ? `Busy: ${JOB_LABEL[job.kind] || job.kind}…` : ""),
+		),
+	];
+	if (!mine && pst && pst.state === "failed") parts.push(h("div", { class: "errors" }, h("div", {}, pst.error || "Failed")));
+	if (!mine && pr.result) parts.push(...pr.result.items.map(tryResult));
+	return h("div", { class: "card try" }, parts);
+}
+
+function tryResult(it) {
+	const ok = it.json_valid && !it.errors.length;
+	return h("div", { class: "try-result" },
+		h("div", { class: "muted" }, "Input: ", clip(it.input, 160)),
+		h("pre", { class: "code-block" }, it.json_valid ? JSON.stringify(it.value, null, 2) : it.generated || "(no answer)"),
+		h("div", { class: "row-between" },
+			h("span", { class: `badge ${ok ? "good" : it.json_valid ? "warning" : "critical"}` }, ok ? "✓ Matches the schema" : `✕ ${it.errors[0]}`),
+			h("button", { class: "ghost small", type: "button", title: "Add this input as a training example, with the answer as its expected output", onclick: () => addTryExample(it, ok) }, "Add as example"),
+		),
+	);
+}
+
+function addTryExample(it, ok) {
+	S.examples.unshift({ id: randomId(), input: it.input, output: ok ? structuredClone(it.value) : skeleton(S.config.schema) });
+	S.page = 0;
+	scheduleExamplesSave();
+	renderExampleCount();
+	renderTrain();
+	toast("Added as the first example. Correct its expected output on the Examples tab, then train again.");
+}
+
+async function tryModel(runId) {
+	if (!S.tryInput.trim()) {
+		toast("Enter an input to try.", true);
+		return;
+	}
+	try {
+		await api(`/projects/${S.pid}/runs/${runId}/predict`, { method: "POST", body: { inputs: [S.tryInput] } });
+		S.system = await api("/system");
+		await selectRun(runId);
+		renderJobBanner();
+		renderTrain();
+		schedulePoll(1000);
+	} catch (e) {
+		toast(e.message, true);
+	}
 }
 
 function metricTiles(m) {
@@ -709,22 +852,60 @@ function metricTiles(m) {
 	);
 }
 
+function rateCell(hits, total, text) {
+	return h("td", { class: "num" + (total && hits / total < 0.5 ? " low" : "") }, total ? text : "-");
+}
+
+function labelBreakdown(fields) {
+	return (fields || []).map((f) => h("div", { class: "breakdown" },
+		h("table", {},
+			h("thead", {}, h("tr", {},
+				h("th", {}, f.kind === "tags" ? `${f.field} (tags)` : f.field),
+				h("th", { class: "num", title: "Scored examples whose expected answer has this value" }, "Examples"),
+				h("th", { class: "num", title: "How many of those examples the model answered with this value" }, "Recognized"),
+				h("th", { class: "num", title: "When the model answered with this value, how often that was right" }, "Precision"),
+			)),
+			h("tbody", {}, f.values.map((v) => h("tr", {},
+				h("td", {}, labelText(v.value)),
+				h("td", { class: "num" }, String(v.expected)),
+				rateCell(v.correct, v.expected, `${v.correct} · ${pct(v.correct / v.expected)}`),
+				rateCell(v.correct, v.predicted, `${pct(v.correct / v.predicted)} of ${v.predicted}`),
+			))),
+		),
+		f.confusions.length ? h("p", { class: "muted" }, "Most common mix-ups (expected → answered): " + f.confusions.map((c) =>
+			`${labelText(c.expected)} → ${c.unknown ? "no valid value" : labelText(c.predicted)} ×${c.count}`).join(" · ")) : null,
+	));
+}
+
+function predictionRow(it) {
+	return h("tr", {},
+		h("td", {}, clip(it.input, 200)),
+		h("td", { class: "mono" }, jsonText(it.expected)),
+		h("td", { class: "mono" }, clip(it.generated, 400)),
+		h("td", {}, it.exact_match
+			? h("span", { class: "badge good" }, "✓ exact")
+			: h("span", { class: `badge ${it.schema_valid ? "warning" : "critical"}` }, it.schema_valid ? "! differs" : "✕ " + (it.errors[0] || "invalid"))),
+	);
+}
+
 function evaluationView(ev) {
 	const fields = Object.entries(ev.field_accuracy || {});
+	const wrong = ev.items.filter((it) => !it.exact_match).length;
+	const toggle = wrong > 0 && wrong < ev.items.length;
+	const body = h("tbody");
+	const fill = () => body.replaceChildren(...ev.items.filter((it) => !(toggle && S.mistakesOnly) || !it.exact_match).slice(0, 100).map(predictionRow));
+	fill();
 	return h("div", {},
 		metricTiles(ev),
 		fields.length > 1 ? h("p", { class: "muted" }, "Per-field accuracy: " + fields.map(([k, v]) => `${k} ${pct(v)}`).join(" · ")) : null,
-		h("details", {}, h("summary", {}, `Predictions (${ev.items.length})`),
+		labelBreakdown(ev.labels),
+		h("details", {}, h("summary", {}, `Predictions (${ev.items.length}` + (wrong ? `, ${wrong} not exact)` : ")")),
+			toggle ? h("label", { class: "check" },
+				h("input", { type: "checkbox", checked: S.mistakesOnly, onchange: (e) => { S.mistakesOnly = e.target.checked; fill(); } }),
+				" Only show mistakes") : null,
 			h("table", {},
 				h("thead", {}, h("tr", {}, ["Input", "Expected", "Generated", ""].map((t) => h("th", {}, t)))),
-				h("tbody", {}, ev.items.slice(0, 100).map((it) => h("tr", {},
-					h("td", {}, clip(it.input, 200)),
-					h("td", { class: "mono" }, jsonText(it.expected)),
-					h("td", { class: "mono" }, clip(it.generated, 400)),
-					h("td", {}, it.exact_match
-						? h("span", { class: "badge good" }, "✓ exact")
-						: h("span", { class: `badge ${it.schema_valid ? "warning" : "critical"}` }, it.schema_valid ? "! differs" : "✕ " + (it.errors[0] || "invalid"))),
-				))),
+				body,
 			),
 		),
 	);

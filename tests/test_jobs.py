@@ -3,7 +3,7 @@ import textwrap
 import time
 
 from llmzempic.fileio import read_json
-from llmzempic.jobs import JobBusy, JobManager
+from llmzempic.jobs import JobBusy, JobManager, job_paths
 
 import pytest
 
@@ -60,3 +60,12 @@ def test_worker_status_is_kept(tmp_path):
 	jobs.start("train", run_dir)
 	assert wait_for(lambda: jobs.current() is None)
 	assert read_json(run_dir / "status.json")["state"] == "completed"
+
+
+def test_job_paths_per_kind(tmp_path):
+	assert job_paths("train", tmp_path) == (tmp_path / "status.json", tmp_path / "train.log")
+	assert job_paths("export", tmp_path) == (tmp_path / "export" / "status.json", tmp_path / "export" / "export.log")
+	assert job_paths("predict", tmp_path) == (tmp_path / "predict" / "status.json", tmp_path / "predict" / "predict.log")
+	with pytest.raises(ValueError):
+		job_paths("nope", tmp_path)
+

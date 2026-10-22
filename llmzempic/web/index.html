@@ -30,7 +30,7 @@
 					<li><b>Task</b> - describe the job and the output structure (JSON Schema).</li>
 					<li><b>Examples</b> - add or import input → expected output pairs. 50-500 is typical.</li>
 					<li><b>Model</b> - pick an open-source base model; bigger is smarter but slower.</li>
-					<li><b>Train</b> - LoRA fine-tuning on your GPU, scored on held-out examples.</li>
+					<li><b>Train</b> - LoRA fine-tuning on your GPU, scored on held-out examples. Try it on your own inputs.</li>
 					<li><b>Export</b> - a GGUF model for Ollama or llama.cpp plus PHP, C# and Python clients.</li>
 				</ol>
 				<button id="welcome-new" type="button">Create a project</button>
@@ -84,6 +84,7 @@
 						<select id="examples-filter">
 							<option value="all">Show all</option>
 							<option value="invalid">Show only problems</option>
+							<option value="duplicates">Show duplicate inputs</option>
 						</select>
 						<span id="examples-summary" class="muted"></span>
 					</div>
@@ -91,6 +92,7 @@
 						<code>{"input": "...", "output": {...}}</code> lines, OpenAI <code>messages</code> records, or a CSV with an
 						<code>input</code> column plus an <code>output</code> JSON column or one column per output field.</p>
 					<div id="import-warnings" class="errors"></div>
+					<div id="dataset-overview"></div>
 					<div id="examples-list"></div>
 					<div id="examples-pager" class="pager"></div>
 					<input id="input-file" type="file" hidden>

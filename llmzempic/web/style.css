@@ -150,6 +150,12 @@ main { padding: 18px 24px 48px; min-width: 0; }
 .example .errors { grid-column: 1 / -1; margin: 0; }
 .example .errors:empty { display: none; }
 .example.bad { border-color: var(--critical); }
+.overview { display: grid; gap: 8px; }
+.overview-row .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.chip { border: 1px solid var(--border); border-radius: 10px; padding: 0 8px; font-size: 12.5px; background: var(--surface-2); }
+.chip .n { margin-left: 6px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.chip.warning, .chip.warning .n { color: var(--warning); border-color: var(--warning); }
+.chip.critical, .chip.critical .n { color: var(--critical); border-color: var(--critical); }
 .pager { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
 
 .errors { color: var(--critical); font-size: 13px; margin: 6px 0; }
@@ -171,6 +177,15 @@ tr.selectable { cursor: pointer; }
 tr.selectable:hover td { background: var(--surface-2); }
 tr.selected td { background: var(--surface-2); box-shadow: inset 0 0 0 0 var(--accent); }
 td.num { font-variant-numeric: tabular-nums; }
+.breakdown { margin: 10px 0; }
+.try { margin: 12px 0; }
+.try h3 { margin-top: 0; }
+.try .row { margin-top: 8px; }
+.try-result { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 10px; }
+.breakdown .num { text-align: right; }
+.breakdown td.low { color: var(--warning); }
+.breakdown table { width: auto; min-width: min(100%, 420px); }
+.breakdown p { margin: 4px 0 0; }
 td .sub { display: block; font-size: 12px; color: var(--text-2); }
 .tier-row td { background: var(--bg); font-weight: 700; font-size: 12.5px; color: var(--text-2); }
 td.mono, .mono { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }

@@ -1,11 +1,11 @@
 """Creating training runs (snapshots of a project) and summarizing them for the UI."""
 
 import json
-import random
 import re
 import time
 
 from . import __version__
+from .dataset import split_examples
 from .fileio import read_json, write_json, write_jsonl
 from .prompts import build_system_prompt
 from .schema_tools import check_schema, validate_output
@@ -53,12 +53,9 @@ def create_run(project):
 		raise RunError(f"{len(invalid)} example(s) don't match the output schema. Fix them on the Examples tab.")
 
 	training = config["training"]
-	rng = random.Random(int(training.get("seed") or 42))
-	shuffled = list(examples)
-	rng.shuffle(shuffled)
-	fraction = float(training.get("eval_fraction") or 0)
-	n_eval = min(200, int(round(len(shuffled) * fraction))) if len(shuffled) >= 10 else 0
-	eval_rows, train_rows = shuffled[:n_eval], shuffled[n_eval:]
+	train_rows, eval_rows, split = split_examples(
+		examples, schema, float(training.get("eval_fraction") or 0), int(training.get("seed") or 42)
+	)
 
 	entry = catalog_entry(config["base_model"])
 	spec = {
@@ -74,6 +71,7 @@ def create_run(project):
 		"training": training,
 		"train_count": len(train_rows),
 		"eval_count": len(eval_rows),
+		"split": split,
 		"created": time.time(),
 		"app_version": __version__,
 	}
@@ -110,6 +108,33 @@ def prepare_export(run_dir, options, settings, tools_dir):
 	return export_dir
 
 
+MAX_PREDICT_INPUTS = 10
+MAX_PREDICT_CHARS = 200_000
+
+
+def prepare_prediction(run_dir, payload):
+	status = read_json(run_dir / "status.json", {}) or {}
+	if status.get("state") != "completed" or not (run_dir / "adapter").exists():
+		raise RunError("Only completed training runs can be tried.")
+	inputs = payload.get("inputs")
+	if not isinstance(inputs, list) or not inputs:
+		raise RunError("Enter an input to try.")
+	if len(inputs) > MAX_PREDICT_INPUTS:
+		raise RunError(f"Try at most {MAX_PREDICT_INPUTS} inputs at a time.")
+	inputs = [str(x or "") for x in inputs]
+	if any(not x.strip() for x in inputs):
+		raise RunError("Enter an input to try.")
+	if any(len(x) > MAX_PREDICT_CHARS for x in inputs):
+		raise RunError("That input is too long to try here.")
+	predict_dir = run_dir / "predict"
+	predict_dir.mkdir(exist_ok=True)
+	for stale in ("result.json", "predict.log"):
+		(predict_dir / stale).unlink(missing_ok=True)
+	write_json(predict_dir / "request.json", {"inputs": inputs})
+	write_json(predict_dir / "status.json", {"state": "queued", "stage": "Waiting to start", "updated": time.time()})
+	return predict_dir
+
+
 def _summary_metrics(evaluation):
 	if not evaluation:
 		return None
@@ -126,6 +151,7 @@ def run_summary(run_dir):
 		"base_model": spec.get("base_model"),
 		"train_count": spec.get("train_count"),
 		"eval_count": spec.get("eval_count"),
+		"split": spec.get("split"),
 		"model_name": model_name(spec),
 		"status": status,
 		"metrics": _summary_metrics(read_json(run_dir / "eval.json", None)),

@@ -1,5 +1,5 @@
 from llmzempic.data import parse_examples
-from llmzempic.metrics import parse_generated, score_predictions
+from llmzempic.metrics import label_breakdown, parse_generated, score_predictions
 from llmzempic.schema_tools import TEMPLATES, check_schema, coerce_value, infer_schema, validate_output
 
 LABEL_SCHEMA = {
@@ -103,3 +103,52 @@ def test_score_predictions():
 	assert result["schema_valid"] == round(2 / 3, 4)
 	assert result["exact_match"] == round(1 / 3, 4)
 	assert result["field_accuracy"] == {"label": round(1 / 3, 4)}
+
+
+def test_label_breakdown_counts_recognized_predicted_and_mixups():
+	rows = [{"input": str(i), "output": {"label": label}} for i, label in enumerate("aaabb")]
+	generated = ['{"label":"a"}', '{"label":"a"}', '{"label":"b"}', '{"label":"a"}', "garbage"]
+	items = score_predictions(rows, generated, LABEL_SCHEMA)["items"]
+	[field] = label_breakdown(items, LABEL_SCHEMA)
+	assert field["field"] == "label" and field["kind"] == "enum"
+	assert field["values"] == [
+		{"value": "a", "expected": 3, "predicted": 3, "correct": 2},
+		{"value": "b", "expected": 2, "predicted": 1, "correct": 0},
+	]
+	assert field["confusions"] == [
+		{"expected": "a", "predicted": "b", "unknown": False, "count": 1},
+		{"expected": "b", "predicted": "a", "unknown": False, "count": 1},
+		{"expected": "b", "predicted": None, "unknown": True, "count": 1},
+	]
+
+
+def test_label_breakdown_tags_booleans_and_bad_input():
+	schema = {
+		"type": "object",
+		"properties": {
+			"tags": {"type": "array", "items": {"enum": ["x", "y", "z"]}},
+			"flag": {"type": "boolean"},
+			"note": {"type": "string"},
+		},
+	}
+	items = [
+		{"expected": {"tags": ["x", "y"], "flag": True}, "generated": '{"tags":["x","z",{"o":1}],"flag":1}'},
+		{"expected": {"tags": ["y"], "flag": False}, "generated": '{"tags":"y","flag":false}'},
+		{"expected": "not an object", "generated": "{}"},
+		{"expected": {"note": "only"}, "generated": None},
+	]
+	fields = {f["field"]: f for f in label_breakdown(items, schema)}
+	assert fields["tags"]["values"] == [
+		{"value": "x", "expected": 1, "predicted": 1, "correct": 1},
+		{"value": "y", "expected": 2, "predicted": 0, "correct": 0},
+		{"value": "z", "expected": 0, "predicted": 1, "correct": 0},
+	]
+	assert fields["tags"]["confusions"] == []
+	assert fields["flag"]["values"] == [
+		{"value": True, "expected": 1, "predicted": 0, "correct": 0},
+		{"value": False, "expected": 1, "predicted": 1, "correct": 1},
+	]
+	assert fields["flag"]["confusions"] == [{"expected": True, "predicted": None, "unknown": True, "count": 1}]
+	assert label_breakdown(items, {"type": "nonsense"}) == []
+	assert label_breakdown([], schema) == []
+
