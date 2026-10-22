@@ -5,10 +5,27 @@ import io
 import json
 import uuid
 
+from .images import IMAGE_NAME
 from .schema_tools import coerce_value
+
+# Inputs can be whole documents; the default limit (131,072 characters) is far too small. 2**31 - 1
+# because the limit is a C long, which is 32 bits on Windows.
+csv.field_size_limit(2**31 - 1)
 
 INPUT_KEYS = ("input", "prompt", "text", "question", "document", "content", "instruction")
 OUTPUT_KEYS = ("output", "completion", "response", "answer", "expected", "target")
+
+
+class InvalidExample(ValueError):
+	"""An example that can't be stored as given."""
+
+
+def image_name(value):
+	# Only names of uploaded images: anything else could point at any file on disk.
+	name = str(value)
+	if not IMAGE_NAME.match(name):
+		raise InvalidExample(f"image {name[:60]!r} isn't the name of an uploaded image")
+	return name
 
 
 def new_id():
@@ -34,7 +51,7 @@ def normalize_example(example):
 		"output": parse_output(example.get("output")),
 	}
 	if example.get("image"):
-		row["image"] = str(example["image"])
+		row["image"] = image_name(example["image"])
 	return row
 
 
@@ -74,40 +91,68 @@ def _from_record(record, schema):
 	return {
 		"input": record[input_key] if input_key else "",
 		"output": output,
-		"image": record[image_key] if image_key else None,
+		"image": image_name(record[image_key]) if image_key and record[image_key] else None,
 	}
+
+
+def _raw_records(f, name):
+	"""Yield (line number, parsed record or None, error or None) from an open text file."""
+	if name.endswith((".csv", ".tsv")):
+		reader = csv.DictReader(f, dialect="excel-tab" if name.endswith(".tsv") else "excel")
+		for record in reader:
+			yield reader.line_num, dict(record), None
+		return
+	start = f.read(4096)
+	f.seek(0)
+	if start.lstrip("\ufeff \t\r\n").startswith("["):
+		try:
+			records = json.load(f)
+		except ValueError as e:
+			yield e.lineno, None, f"not valid JSON ({e.msg})"
+			return
+		for i, record in enumerate(records, start=1):
+			yield i, record, None
+		return
+	for i, line in enumerate(f, start=1):
+		line = line.lstrip("\ufeff").strip()
+		if not line:
+			continue
+		try:
+			yield i, json.loads(line), None
+		except ValueError as e:
+			yield i, None, f"not valid JSON ({e.msg})"
+
+
+def _iter_file(f, name, schema):
+	for where, record, error in _raw_records(f, name.lower()):
+		if error is None and not isinstance(record, dict):
+			error = "expected an object"
+		if error is None:
+			try:
+				example = _from_record(record, schema)
+				record_id = record.get(_pick(record, ("id",)) or "id")
+				if record_id not in (None, ""):
+					example["id"] = str(record_id)
+				yield where, example, None
+				continue
+			except ValueError as e:
+				error = str(e)
+		yield where, None, f"Line {where}: {error}"
+
+
+def iter_records(path, filename, schema=None):
+	"""Stream examples from a JSONL, JSON array or CSV/TSV file. Yields (line number, example or
+	None, warning or None); a bad line becomes a warning and never stops the import."""
+	with open(path, "r", encoding="utf-8-sig", newline="") as f:
+		yield from _iter_file(f, filename or "", schema)
 
 
 def parse_examples(text, filename="", schema=None):
 	"""Parse JSONL, a JSON array, or CSV/TSV text into examples. Returns (examples, warnings)."""
-	text = text.lstrip("﻿")
-	name = (filename or "").lower()
-	warnings = []
-	records = []
-
-	if name.endswith((".csv", ".tsv")):
-		dialect = "excel-tab" if name.endswith(".tsv") else "excel"
-		reader = csv.DictReader(io.StringIO(text), dialect=dialect)
-		records = [(i + 2, dict(r)) for i, r in enumerate(reader)]
-	elif text.strip().startswith("["):
-		data = json.loads(text)
-		records = [(i + 1, r) for i, r in enumerate(data)]
-	else:
-		for i, line in enumerate(text.splitlines(), start=1):
-			if not line.strip():
-				continue
-			try:
-				records.append((i, json.loads(line)))
-			except ValueError as e:
-				warnings.append(f"Line {i}: not valid JSON ({e.msg})")
-
-	examples = []
-	for where, record in records:
-		if not isinstance(record, dict):
-			warnings.append(f"Record {where}: expected an object")
-			continue
-		try:
-			examples.append(normalize_example(_from_record(record, schema)))
-		except ValueError as e:
-			warnings.append(f"Record {where}: {e}")
+	examples, warnings = [], []
+	for _, example, warning in _iter_file(io.StringIO(text.lstrip("\ufeff"), newline=""), filename or "", schema):
+		if example is not None:
+			examples.append(normalize_example(example))
+		else:
+			warnings.append(warning)
 	return examples, warnings

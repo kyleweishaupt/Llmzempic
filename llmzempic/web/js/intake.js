@@ -1,9 +1,9 @@
 import { uploadImage } from "./api.js";
 import { $, button, callout, h, icon, mount } from "./dom.js";
 import { toast } from "./feedback.js";
-import { plural, randomId } from "./format.js";
+import { plural } from "./format.js";
 import { outputForm } from "./output-form.js";
-import { scheduleExamplesSave } from "./project.js";
+import { addExamples } from "./example-ops.js";
 import { blankOutput, labelFields } from "./schema-model.js";
 import { S, isImageProject, schemaTree } from "./state.js";
 
@@ -95,9 +95,20 @@ export function openIntake(files) {
 		cancelBtn.textContent = "Stop";
 		progressSlot.hidden = false;
 		S.lastLabel = structuredClone(answer);
-		const known = new Set(S.examples.map((e) => e.image).filter(Boolean));
-		let done = 0, added = 0, skipped = 0;
+		const known = new Set();
 		const failures = [];
+		let done = 0, added = 0, skipped = 0;
+		let pending = [];
+		const flush = async () => {
+			const rows = pending;
+			pending = [];
+			if (!rows.length) return;
+			try {
+				added += (await addExamples(rows)).length;
+			} catch (e) {
+				failures.push(`${plural(rows.length, "example")} couldn't be saved: ${e.message}`);
+			}
+		};
 		const bar = h("span", { style: { width: "0%" } });
 		const label = h("span", { class: "muted small" });
 		mount(progressSlot, h("div", { class: "progress" }, bar), label);
@@ -113,8 +124,8 @@ export function openIntake(files) {
 				if (known.has(name)) skipped++;
 				else {
 					known.add(name);
-					S.examples.unshift({ id: randomId(), input: text, image: name, output: structuredClone(answer) });
-					added++;
+					pending.push({ input: text, image: name, output: structuredClone(answer) });
+					if (pending.length >= 50) flush();
 				}
 				tick();
 			},
@@ -124,12 +135,12 @@ export function openIntake(files) {
 				tick();
 			},
 		});
+		await flush();
 		running = false;
-		S.page = 0;
-		if (added) scheduleExamplesSave();
+		S.query = { filter: "all", search: "", label: null, offset: 0 };
 		document.dispatchEvent(new CustomEvent("examples-changed"));
 		const summary = [`Added ${plural(added, "example")}.`];
-		if (skipped) summary.push(`${plural(skipped, "image")} already in this project were skipped.`);
+		if (skipped) summary.push(`${plural(skipped, "copy", "copies")} of the same image were added once.`);
 		if (stop) summary.push("Stopped before the rest were uploaded.");
 		if (!failures.length) {
 			close();

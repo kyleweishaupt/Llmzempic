@@ -1,5 +1,6 @@
 import { $, $$, button, h, icon, menu, mount, preserveFocus, toggleSwitch } from "./dom.js";
 import { ITEM_KINDS, KINDS, changeKind, newNode, problems, toSchema } from "./schema-model.js";
+import { S } from "./state.js";
 
 // Visual editor for a schema tree (see schema-model.js). Calls onChange(schema) after every edit
 // that leaves the tree valid; invalid edits are highlighted and not emitted.
@@ -80,8 +81,27 @@ export function schemaEditor(root, onChange) {
 		return h("label", { class: "inline-field" }, h("span", {}, label), input);
 	}
 
+	function datasetSelect(node) {
+		const sets = S.datasets || [];
+		if (!sets.length) {
+			return h("div", { class: "row small muted" }, "No data sets yet.",
+				h("a", { href: "#datasets" }, "Upload one"), "to pick values from it.");
+		}
+		const select = h("select", { "aria-label": "Data set" },
+			h("option", { value: "", disabled: true, selected: !node.dataset }, "Choose a data set…"),
+			sets.map((d) => h("option", { value: d.id, selected: d.id === node.dataset }, `${d.name} (${d.rows.toLocaleString()} values)`)),
+			node.dataset && !sets.some((d) => d.id === node.dataset) ? h("option", { value: node.dataset, selected: true }, `${node.dataset} (missing)`) : null,
+		);
+		select.addEventListener("change", () => { node.dataset = select.value; commit(false); });
+		return h("label", { class: "inline-field" }, h("span", {}, "Values from"), select, h("a", { href: "#datasets", class: "small" }, "Manage"));
+	}
+
+	const itemCounts = (node) => h("div", { class: "row" }, numberInput(node, "minItems", "At least"), numberInput(node, "maxItems", "At most"));
+
 	function kindSpecific(node) {
-		if (node.kind === "choice" || node.kind === "tags") return optionsEditor(node);
+		if (node.kind === "choice") return optionsEditor(node);
+		if (node.kind === "tags") return h("div", { class: "stack" }, optionsEditor(node), itemCounts(node));
+		if (node.kind === "dataset") return datasetSelect(node);
 		if (node.kind === "number" || node.kind === "integer") {
 			return h("div", { class: "row" }, numberInput(node, "minimum", "Min"), numberInput(node, "maximum", "Max"));
 		}
@@ -93,7 +113,8 @@ export function schemaEditor(root, onChange) {
 				commit(true);
 			});
 			return h("div", { class: "stack" },
-				h("label", { class: "inline-field" }, h("span", {}, "Each item is"), select),
+				h("div", { class: "row" }, h("label", { class: "inline-field" }, h("span", {}, "Each item is"), select), itemCounts(node)),
+				node.item && node.item.kind === "dataset" ? datasetSelect(node.item) : null,
 				node.item && node.item.kind === "object" ? fieldList(node.item) : null,
 			);
 		}

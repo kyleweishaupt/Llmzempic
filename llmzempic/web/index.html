@@ -24,6 +24,7 @@
 	<link rel="stylesheet" href="css/examples.css">
 	<link rel="stylesheet" href="css/model.css">
 	<link rel="stylesheet" href="css/train.css">
+	<link rel="stylesheet" href="css/datasets.css">
 </head>
 <body>
 	<header class="mobile-bar">
@@ -44,11 +45,13 @@
 					<span class="brand-sub">Fine-tune small models for JSON</span>
 				</span>
 			</div>
+			<button id="datasets-link" class="side-link" type="button">
+				<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+				Data sets
+			</button>
 			<div class="side-head">
 				<span>Projects</span>
-				<button id="new-project-btn" class="btn btn-ghost btn-icon btn-sm" type="button" title="New project" aria-label="New project">
-					<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
-				</button>
+				<span id="new-project-slot"></span>
 			</div>
 			<nav id="project-list" class="project-list"></nav>
 			<div class="side-foot">
@@ -67,6 +70,7 @@
 
 		<main class="main">
 			<section id="welcome" class="welcome" hidden></section>
+			<section id="datasets-page" class="page-body" hidden></section>
 
 			<section id="project" hidden>
 				<header class="page-head">

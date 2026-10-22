@@ -1,12 +1,12 @@
 import { imageUrl } from "./api.js";
 import { button, h, icon, mount } from "./dom.js";
 import { deleteExamples, visibleExamples } from "./example-ops.js";
-import { toastError } from "./feedback.js";
+import { saver, toastError } from "./feedback.js";
 import { pickImages, uploadPrepared } from "./intake.js";
 import { labelText } from "./format.js";
 import { jsonBlock } from "./json-view.js";
 import { outputForm } from "./output-form.js";
-import { scheduleExamplesSave } from "./project.js";
+import { loadPage, pageSize, saveExample } from "./project.js";
 import { blankOutput, labelFields, labelValues } from "./schema-model.js";
 import { S, app, exampleErrors, schemaTree } from "./state.js";
 
@@ -24,11 +24,32 @@ export function openReview(id) {
 		return parsed.ok ? labelFields(parsed.root)[0] || null : null;
 	};
 
-	function go(delta) {
+	// Moving past either end of the page loads the neighbouring page.
+	async function go(delta) {
+		const target = index + delta;
+		if (target >= list.length && S.query.offset + list.length < S.total) {
+			await saver.flush();
+			S.query.offset += pageSize();
+			await loadPage({ stats: false });
+			index = 0;
+		} else if (target < 0 && S.query.offset > 0) {
+			await saver.flush();
+			S.query.offset = Math.max(0, S.query.offset - pageSize());
+			await loadPage({ stats: false });
+			index = S.examples.length - 1;
+		} else {
+			index = Math.min(S.examples.length - 1, Math.max(0, target));
+		}
 		list = visibleExamples();
 		if (!list.length) { dlg.close(); return; }
-		index = Math.min(list.length - 1, Math.max(0, index + delta));
 		render();
+	}
+
+	const position = () => S.query.offset + index;
+
+	async function remove(ex) {
+		await deleteExamples({ ids: [ex.id] });
+		go(0);
 	}
 
 	function label(value) {
@@ -37,8 +58,8 @@ export function openReview(id) {
 		if (!ex || !field) return;
 		if (!isObj(ex.output)) ex.output = blankOutput(S.config.schema);
 		ex.output[field.name] = value;
-		scheduleExamplesSave();
-		if (index < list.length - 1) go(1);
+		saveExample(ex);
+		if (position() < S.total - 1) go(1);
 		else render();
 	}
 
@@ -47,7 +68,7 @@ export function openReview(id) {
 			if (!file) return;
 			try {
 				ex.image = await uploadPrepared(file);
-				scheduleExamplesSave();
+				saveExample(ex);
 				render();
 			} catch (e) {
 				toastError(e);
@@ -62,19 +83,19 @@ export function openReview(id) {
 		const errors = exampleErrors(ex.id);
 		const field = quickField();
 		const text = h("textarea", { rows: 3, value: ex.input, placeholder: "Optional text sent with the image", "data-focus": `${ex.id}:input` });
-		text.addEventListener("input", () => { ex.input = text.value; scheduleExamplesSave(); });
+		text.addEventListener("input", () => { ex.input = text.value; saveExample(ex); });
 		const answer = parsed.ok && isObj(ex.output)
-			? outputForm(parsed.root, ex.output, () => scheduleExamplesSave(), { keyPrefix: `review-${ex.id}` })
+			? outputForm(parsed.root, ex.output, () => saveExample(ex), { keyPrefix: `review-${ex.id}` })
 			: jsonBlock(ex.output ?? null);
 		mount(dlg,
 			h("div", { class: "review-media" },
 				ex.image ? h("img", { src: imageUrl(S.pid, ex.image), alt: ex.input || "Example image" }) : h("div", { class: "review-missing" }, icon("image"), "This example has no image"),
-				h("button", { type: "button", class: "review-nav prev", "aria-label": "Previous example", disabled: index === 0, onclick: () => go(-1) }, icon("chevron-left")),
-				h("button", { type: "button", class: "review-nav next", "aria-label": "Next example", disabled: index >= list.length - 1, onclick: () => go(1) }, icon("chevron-right")),
+				h("button", { type: "button", class: "review-nav prev", "aria-label": "Previous example", disabled: position() === 0, onclick: () => go(-1) }, icon("chevron-left")),
+				h("button", { type: "button", class: "review-nav next", "aria-label": "Next example", disabled: position() >= S.total - 1, onclick: () => go(1) }, icon("chevron-right")),
 			),
 			h("div", { class: "review-side" },
 				h("div", { class: "spread" },
-					h("span", { class: "muted num" }, `${index + 1} of ${list.length}`),
+					h("span", { class: "muted num" }, `${(position() + 1).toLocaleString()} of ${S.total.toLocaleString()}`),
 					button(null, { icon: "x", kind: "ghost", title: "Close", onclick: () => dlg.close() }),
 				),
 				h("div", { class: "field" }, h("span", { class: "field-label" }, "Answer"), answer),
@@ -82,7 +103,7 @@ export function openReview(id) {
 				h("label", { class: "field" }, h("span", { class: "field-label" }, "Text", h("span", { class: "faint" }, "optional")), text),
 				h("div", { class: "row" },
 					button(ex.image ? "Replace image" : "Add image", { icon: "image", kind: "secondary", size: "sm", onclick: () => replaceImage(ex) }),
-					button("Delete", { icon: "trash", kind: "danger-quiet", size: "sm", onclick: () => { deleteExamples([ex.id]); go(0); } }),
+					button("Delete", { icon: "trash", kind: "danger-quiet", size: "sm", onclick: () => remove(ex) }),
 				),
 				h("div", { class: "grow" }),
 				h("dl", { class: "review-keys small" },
@@ -101,7 +122,7 @@ export function openReview(id) {
 		if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
 		if (e.key === "ArrowLeft") { e.preventDefault(); go(-1); }
 		else if (e.key === "ArrowRight") { e.preventDefault(); go(1); }
-		else if (e.key === "Delete") { e.preventDefault(); const ex = list[index]; if (ex) { deleteExamples([ex.id]); go(0); } }
+		else if (e.key === "Delete") { e.preventDefault(); if (list[index]) remove(list[index]); }
 		else if (/^[1-9]$/.test(e.key)) {
 			const field = quickField();
 			const values = field ? labelValues(field) : [];

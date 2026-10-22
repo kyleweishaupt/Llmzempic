@@ -32,8 +32,9 @@ then `pip install -e .[train,cuda]`.
 
 1. **Task** - choose the input (text, or images with optional text), write instructions
 	("Classify the support ticket…") and design the answer. The visual editor covers text, numbers,
-	yes/no, one or several of a list of options, lists and nested groups, with a live preview of the
-	answer; switch to the raw JSON Schema for anything else. Start from a template (classification,
+	yes/no, one or several of a list of options, values from a [data set](#data-sets), lists (with
+	at least / at most counts) and nested groups, with a live preview of the answer; switch to the raw
+	JSON Schema for anything else. Start from a template (classification,
 	tagging, field extraction, file analysis, sentiment, image yes/no, image classification) or infer
 	the schema from your examples.
 2. **Examples** - each answer is edited with a form generated from the schema (or as JSON).
@@ -51,7 +52,8 @@ then `pip install -e .[train,cuda]`.
 	at once (with undo), and a full-size review view for fast labeling: `1`-`9` set the first yes/no
 	or option field and move on, `←`/`→` browse, `Del` deletes.
 
-	Every output is validated against the schema; training won't start until they all match.
+	Every output is validated against the schema (and its data sets) in the background; training
+	won't start until the check finishes and they all match.
 	20 examples is a minimum, 100-500 covering every label and edge case is better. The tab counts
 	examples per label (enum, boolean and tag fields) and flags labels with no examples and inputs
 	that appear more than once, especially copies with different outputs.
@@ -63,12 +65,55 @@ then `pip install -e .[train,cuda]`.
 	exact match, with per-example predictions. Held-out examples are picked in proportion for each
 	value of the first enum or boolean field, and copies of an input stay on the same side. Enum,
 	boolean and tag fields also get a per-label breakdown (how often each value is recognized,
-	precision) and the most common mix-ups. **Try it** runs a finished model on your own input or
+	precision) and the most common mix-ups; data set fields get exact, first value, precision, recall,
+	F1 and not-in-the-set rates, plus a per-value table that opens the matching examples. **Try it** runs a finished model on your own input or
 	image; "Add as example" turns the answer into a new example to correct, so mistakes feed the next
 	run.
 5. **Export** - creates a GGUF model (Q8_0 by default), an Ollama `Modelfile`, the schema, the
 	exact system prompt, a manifest, and client code. Image models also get their image encoder as
 	`mmproj-<name>-f16.gguf`. Optionally registers the model with Ollama.
+
+## Data sets
+
+Some answers have to come from a fixed list: product codes, category codes, account numbers. Add the
+list once on the **Data sets** page (CSV, TSV, TXT with one value per line, or JSON; for CSV pick the
+value column and an optional description column) and use it in any project with the "Value from a data
+set" field type, alone or as the items of a list (ordered, with at least / at most counts). Lists of a
+million values are fine.
+
+- Answers are checked against the set, and example forms pick values with a search box that matches
+  values by prefix and descriptions by words.
+- The model's prompt names the set ("One value from the data set …") but never lists it.
+- A run keeps its own copy of every set it used, so replacing a set later doesn't change old runs.
+  A set used by a project can't be deleted, and values can't contain line breaks.
+
+## Large example sets
+
+Examples live in SQLite (`examples.db` in the project folder), so the Examples tab pages, searches and
+filters on the server: with 200,000 examples of about 5 KB each a page, a search or a value filter answers
+in well under a second. Imports stream files of any size with progress (add, update by id, or replace
+all), and checking runs in the background with live progress. "Select all N matching" applies a bulk
+answer or delete to everything a search or filter matches, with undo.
+
+Training streams examples from disk too. Examples longer than *Max tokens per example* are skipped
+and listed in the run view (`skipped.json` in the run folder). *Use at most N examples* trains on a
+sample; values with few examples are never sampled away or held out, so the model sees every value
+it has examples for. At most *Held-out examples to score* (300 by default, up to 2,000) are scored.
+`python tools/make_scale_fixture.py --examples 200000 --values 70000 --out <folder>` writes a synthetic
+project of that size for testing.
+
+## Resuming training
+
+Training saves a checkpoint every tenth of the run (every 50 steps on short runs). If it stops or
+fails, **Resume** on the run picks up from the last checkpoint.
+
+## Project packages
+
+The project menu's **Export package…** saves a `.llmz` file with the project's settings, examples,
+images and data sets, optionally with the latest trained run. **Import package…** (the + next to
+Projects) recreates it on another machine, for example to train a bigger model on a stronger GPU; data
+sets already present with the same content are reused. **Duplicate project** makes a copy to try a
+different schema or model without touching the original.
 
 ## Using the model from your code
 
@@ -89,6 +134,13 @@ export's README.
 The clients pass the JSON Schema to the server, which constrains decoding so every response is
 schema-valid JSON. Fine-tuning makes the *content* right; constrained decoding guarantees the
 *shape*. Use temperature 0 for deterministic answers.
+
+Projects with data sets export each set as `datasets/<id>.txt` and a `grammar.gbnf` that spells the
+allowed values as a prefix tree. Start llama-server with `--grammar-file grammar.gbnf` (a 2024 or later
+build) and every data set field can only answer with values from its list; requests then carry no
+`response_format`. The generated clients call llama-server. Ollama can't enforce lists that long; with
+it, turn on the clients' value check, which compares every answer with `datasets/` and raises an error
+naming any value that isn't on its list.
 
 ## Performance
 
@@ -112,6 +164,8 @@ llmzempic train <project>         # train without the UI
 llmzempic try <run folder> "text" # answer an input with a trained run
 llmzempic try <run folder> --image photo.jpg   # image runs; repeat --image for more
 llmzempic export <run folder> --gguf q4_k_m --ollama
+llmzempic package <project> --include-run      # save a .llmz package
+llmzempic import-package <file.llmz>
 llmzempic doctor                  # detected GPU, memory and libraries
 ```
 
@@ -132,7 +186,8 @@ python -m venv .venv && .venv/bin/python -m pip install -e .[dev]
 .venv/bin/python -m pytest
 ```
 
-Layout: `llmzempic/server.py` and `image_api.py` (API), `web/` (UI: `index.html`, `css/` and
+Layout: `llmzempic/server.py` plus `*_api.py` routers (API), `web/` (UI: `index.html`, `css/` and
 `js/` ES modules, no build step), `trainer.py`, `vision.py` and `exporter.py` (run in the worker
-process), `runs.py`, `workspace.py` and `images.py` (on-disk projects), `catalog.json` (base model
-list).
+process), `runs.py`, `workspace.py`, `example_store.py`, `checks.py` and `images.py` (on-disk
+projects), `datasets.py` and `refs.py` (data sets), `grammar.py` and `client_checks.py` (exports),
+`packages.py`, `catalog.json` (base model list).

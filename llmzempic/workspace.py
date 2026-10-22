@@ -1,15 +1,17 @@
-"""On-disk layout: <workspace>/projects/<id>/{project.json, examples.jsonl, runs/<run id>/...}."""
+"""On-disk layout: <workspace>/projects/<id>/{project.json, examples.db, images/, runs/<run id>/...}
+and <workspace>/datasets/<id>/ for reference data sets."""
 
 import copy
 import json
 import os
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
-from .data import normalize_example
-from .fileio import read_json, read_jsonl, write_json, write_jsonl
+from .example_store import ExampleStore
+from .fileio import read_json, write_json
 from .images import remove_orphans
 from .schema_tools import get_template
 
@@ -26,6 +28,8 @@ DEFAULT_TRAINING = {
 	"grad_accum": 2,
 	"max_seq_length": 0,
 	"eval_fraction": 0.1,
+	"eval_max": 300,
+	"max_examples": 0,
 	"quantization": "auto",
 	"accelerator": "auto",
 	"seed": 42,
@@ -38,6 +42,10 @@ PRESETS = {
 }
 
 DEFAULT_SETTINGS = {"hf_token": "", "llama_cpp_dir": ""}
+
+# One ExampleStore per project folder for the life of the process: opening one migrates and tidies.
+_stores = {}
+_stores_lock = threading.Lock()
 
 
 def default_workspace():
@@ -75,7 +83,7 @@ class Project:
 
 	@property
 	def examples_path(self):
-		return self.path / "examples.jsonl"
+		return self.path / "examples.db"
 
 	@property
 	def runs_dir(self):
@@ -100,14 +108,15 @@ class Project:
 		write_json(self.config_path, current)
 		return current
 
-	def load_examples(self):
-		return read_jsonl(self.examples_path)
-
-	def save_examples(self, examples):
-		rows = [normalize_example(e) for e in examples]
-		write_jsonl(self.examples_path, rows)
-		remove_orphans(self.images_dir, {r["image"] for r in rows if r.get("image")})
-		return rows
+	def examples(self):
+		key = str(self.path.resolve())
+		with _stores_lock:
+			store = _stores.get(key)
+			if store is None:
+				store = ExampleStore(self.examples_path)
+				remove_orphans(self.images_dir, store.referenced_images())
+				_stores[key] = store
+		return store
 
 	def run_path(self, run_id):
 		if not SAFE_ID.match(run_id or ""):
@@ -143,6 +152,11 @@ class Workspace:
 	@property
 	def settings_path(self):
 		return self.root / "settings.json"
+
+	@property
+	def library(self):
+		from .datasets import Library  # datasets imports this module for ids
+		return Library(self.root / "datasets")
 
 	def load_settings(self):
 		settings = dict(DEFAULT_SETTINGS)
@@ -186,11 +200,12 @@ class Workspace:
 		path.mkdir(parents=True)
 		project = Project(path)
 		write_json(project.config_path, {**default_config(name, template_id), "created": time.time()})
-		write_jsonl(project.examples_path, [])
 		return project
 
 	def delete(self, project_id):
 		project = self.get(project_id)
+		with _stores_lock:
+			_stores.pop(str(project.path.resolve()), None)
 		shutil.rmtree(project.path)
 
 

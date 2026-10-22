@@ -2,25 +2,17 @@
 
 Every client asks the server to constrain decoding to the JSON Schema (Ollama `format`,
 llama-server `response_format`), so responses always parse; the fine-tune makes them correct.
-Clients for image models take an image file (sent base64-encoded) plus optional text.
+Data set projects get llama-server clients instead (server_clients.py): the server loads a grammar
+that holds every data set field to its list. Clients for image models take an image file (sent
+base64-encoded) plus optional text.
 """
 
 import json
 import pprint
-import re
 
+from .client_types import cs_result, pascal, snake
 from .schema_tools import compact_json
-
-
-def pascal(name):
-	words = re.split(r"[^A-Za-z0-9]+", name)
-	ident = "".join(w[:1].upper() + w[1:] for w in words if w)
-	return ident if ident[:1].isalpha() else f"Model{ident}"
-
-
-def snake(name):
-	ident = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
-	return ident if ident[:1].isalpha() else f"model_{ident}"
+from .server_clients import csharp_server_client, php_server_client, python_server_client
 
 
 def php_client(name, schema, vision=False):
@@ -85,52 +77,6 @@ function {fn}({params}, string $host = 'http://localhost:11434'): array
 """
 
 
-_CS_SIMPLE = {"string": "string", "integer": "long", "number": "double", "boolean": "bool"}
-
-
-def _cs_type(schema, name_hint, classes):
-	"""Map a JSON Schema node to a C# type, generating classes for nested objects."""
-	types = schema.get("type")
-	types = types if isinstance(types, list) else [types]
-	nullable = "null" in types
-	main = next((t for t in types if t and t != "null"), None)
-	if main is None and "enum" in schema:
-		main = "string"
-	if main == "object" and isinstance(schema.get("properties"), dict):
-		return _cs_class(schema, name_hint, classes) + ("?" if nullable else ""), "" if nullable else " = new();"
-	if main == "array":
-		item = _cs_type(schema.get("items") or {}, name_hint + "Item", classes)[0]
-		return f"List<{item}>" + ("?" if nullable else ""), "" if nullable else " = new();"
-	if main in _CS_SIMPLE:
-		cs = _CS_SIMPLE[main]
-		if nullable:
-			return cs + "?", ""
-		return cs, ' = "";' if cs == "string" else ""
-	return "JsonElement", ""
-
-
-def _cs_class(schema, name, classes):
-	base, n = name, 2
-	while name in classes:
-		name, n = f"{base}{n}", n + 1
-	classes[name] = ""
-	lines = [f"public sealed class {name}", "{"]
-	for key, prop in schema["properties"].items():
-		prop = prop if isinstance(prop, dict) else {}
-		member = pascal(key)
-		if member == name:
-			member += "Value"
-		cs_type, init = _cs_type(prop, member, classes)
-		if prop.get("enum"):
-			values = ", ".join(json.dumps(v) for v in prop["enum"])
-			lines.append(f"\t/// <summary>One of: {values}</summary>")
-		lines.append(f'\t[JsonPropertyName("{key}")]')
-		lines.append(f"\tpublic {cs_type} {member} {{ get; set; }}{init}")
-	lines.append("}")
-	classes[name] = "\n".join(lines)
-	return name
-
-
 def csharp_client(name, schema, vision=False):
 	cls = pascal(name)
 	if vision:
@@ -141,16 +87,8 @@ def csharp_client(name, schema, vision=False):
 		params = "string input, CancellationToken cancellationToken = default"
 		read = ""
 		message = '["role"] = "user", ["content"] = input'
-	classes = {}
-	result_type = "JsonElement"
-	if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
-		result_type = _cs_class(schema, f"{cls}Result", classes)
+	result_type, classes, deserialize = cs_result(schema, cls)
 	schema_literal = compact_json(schema).replace('"', '""')
-	deserialize = (
-		"using var result = JsonDocument.Parse(text);\n\t\treturn result.RootElement.Clone();"
-		if result_type == "JsonElement"
-		else f"return JsonSerializer.Deserialize<{result_type}>(text)\n\t\t\t?? throw new InvalidOperationException(\"Model returned null.\");"
-	)
 	return f"""// Calls the fine-tuned "{name}" model through Ollama (https://ollama.com). Targets .NET 6+.
 // One-time setup, from the export folder: ollama create {name} -f Modelfile
 // To use llama-server instead, POST to /v1/chat/completions with the system prompt from
@@ -201,7 +139,7 @@ public sealed class {cls}Client
 	}}
 }}
 
-{(chr(10) + chr(10)).join(classes.values())}
+{classes}
 """
 
 
@@ -222,7 +160,6 @@ def python_client(name, schema, vision=False):
 {imports}
 
 SCHEMA = {pprint.pformat(schema, indent=1, width=100, sort_dicts=False)}
-
 
 def {fn}({params}, host="http://localhost:11434"):
 {read}	payload = {{
@@ -251,29 +188,38 @@ IMAGE_PLACEHOLDER = "data:image/jpeg;base64,PUT_BASE64_IMAGE_HERE"
 
 
 def llama_server_request(system_prompt, schema, example_input="Text to analyze", vision=False):
+	"""Without a schema (data set projects) the server's --grammar-file does the constraining: a
+	response_format would make it build a grammar for every request instead."""
 	content = example_input
 	if vision:
 		# OpenAI-style content parts; the text part is optional, like in training.
 		content = [{"type": "image_url", "image_url": {"url": IMAGE_PLACEHOLDER}}]
 		if example_input:
 			content.append({"type": "text", "text": example_input})
-	return {
+	request = {
 		"messages": [
 			{"role": "system", "content": system_prompt},
 			{"role": "user", "content": content},
 		],
 		"temperature": 0,
-		"response_format": {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}},
 	}
+	if schema is not None:
+		request["response_format"] = {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}}
+	return request
 
 
-def llama_server_usage(gguf_file, ctx, mmproj_file=None, image_tokens=None):
+def llama_server_command(gguf_file, ctx, mmproj_file=None, image_tokens=None, grammar=False):
 	images = ""
 	if mmproj_file:
 		images = f" --mmproj {mmproj_file}" + (f" --image-max-tokens {image_tokens}" if image_tokens else "")
+	return f"llama-server -m {gguf_file or 'model.gguf'}{images}{' --grammar-file grammar.gbnf' if grammar else ''} --port 8080 -c {ctx}"
+
+
+def llama_server_usage(gguf_file, ctx, mmproj_file=None, image_tokens=None, grammar=False):
 	usage = (
 		f"# Serve the model with llama.cpp (https://github.com/ggml-org/llama.cpp/releases)\n"
-		f"llama-server -m {gguf_file or 'model.gguf'}{images} --port 8080 -c {ctx}\n\n"
+		+ ("# grammar.gbnf keeps every data set field to its list (needs a 2024 or later llama-server).\n" if grammar else "")
+		+ llama_server_command(gguf_file, ctx, mmproj_file, image_tokens, grammar) + "\n\n"
 		"# Call it (OpenAI-compatible). request.json includes the system prompt the model was trained with.\n"
 	)
 	if mmproj_file:
@@ -281,15 +227,23 @@ def llama_server_usage(gguf_file, ctx, mmproj_file=None, image_tokens=None):
 	return usage + "curl http://localhost:8080/v1/chat/completions -H \"Content-Type: application/json\" -d @llama-server-request.json\n"
 
 
-def all_snippets(name, schema, system_prompt, gguf_file=None, ctx=4096, vision=False, mmproj_file=None, image_tokens=None):
+def all_snippets(name, schema, system_prompt, gguf_file=None, ctx=4096, vision=False, mmproj_file=None, image_tokens=None, refs=None):
 	example = "" if vision else "Text to analyze"
 	if vision and gguf_file and not mmproj_file:
 		mmproj_file = f"mmproj-{name}-f16.gguf"
+	request = llama_server_request(system_prompt, None if refs else schema, example, vision)
+	if refs:
+		serve = llama_server_command(gguf_file, ctx, mmproj_file if vision else None, image_tokens, True)
+		clients = {
+			"php": php_server_client(name, system_prompt, vision, refs, serve),
+			"csharp": csharp_server_client(name, schema, system_prompt, vision, refs, serve),
+			"python": python_server_client(name, system_prompt, vision, refs, serve),
+		}
+	else:
+		clients = {"php": php_client(name, schema, vision), "csharp": csharp_client(name, schema, vision), "python": python_client(name, schema, vision)}
 	return {
-		"php": php_client(name, schema, vision),
-		"csharp": csharp_client(name, schema, vision),
-		"python": python_client(name, schema, vision),
-		"llama_server": llama_server_usage(gguf_file, ctx, mmproj_file if vision else None, image_tokens)
+		**clients,
+		"llama_server": llama_server_usage(gguf_file, ctx, mmproj_file if vision else None, image_tokens, bool(refs))
 		+ "\n# llama-server-request.json\n"
-		+ json.dumps(llama_server_request(system_prompt, schema, example, vision), indent=2, ensure_ascii=False),
+		+ json.dumps(request, indent=2, ensure_ascii=False),
 	}

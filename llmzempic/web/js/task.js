@@ -18,7 +18,7 @@ function previewBody() {
 	const parsed = fromSchema(S.config.schema);
 	if (!parsed.ok) return h("p", { class: "faint" }, "A preview appears for schemas the visual editor understands.");
 	if (!parsed.root.fields.length) return h("p", { class: "faint" }, "Add output fields to see the answer take shape.");
-	return jsonBlock(sample(parsed.root));
+	return jsonBlock(sample(parsed.root, Object.fromEntries(S.datasets.map((d) => [d.id, d.name]))));
 }
 
 function updatePreview() {
@@ -36,7 +36,7 @@ function updateServerBits() {
 // Switching the input kind also moves the base model to one that can read that kind of input.
 async function setInputKind(kind) {
 	if (kind === S.config.input_kind) return;
-	if (kind === "image" && S.examples.some((e) => !e.image)) {
+	if (kind === "image" && S.counts.all) {
 		const ok = await confirmAction({
 			title: "Switch this project to images?",
 			text: "Examples without an image will be flagged until you give each one a picture or delete it.",
@@ -125,7 +125,7 @@ function outputCard() {
 				menu(button("Start from…", { icon: "layers", kind: "secondary", size: "sm" }), [
 					...templates.map((t) => ({ label: t.name, icon: t.input_kind === "image" ? "image" : "text", onclick: () => applyTemplate(t) })),
 					"-",
-					{ label: "Infer from example answers", icon: "braces", disabled: !S.examples.length, onclick: inferSchema },
+					{ label: "Infer from example answers", icon: "braces", disabled: !S.counts.all, onclick: inferSchema },
 				]),
 			),
 		),

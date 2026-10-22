@@ -4,6 +4,7 @@ The exact system prompt built here is baked into every export (Modelfile, manife
 deployed model sees the same text it was trained on.
 """
 
+from .refs import prompt_schema, referenced_ids
 from .schema_tools import compact_json
 
 SCHEMA_HEADER = "Respond with only a JSON value that conforms to this JSON Schema, with no other text:"
@@ -18,10 +19,12 @@ FALLBACK_CHAT_TEMPLATE = (
 )
 
 
-def build_system_prompt(instructions, schema, include_schema=True):
+def build_system_prompt(instructions, schema, include_schema=True, dataset_names=None):
 	parts = [(instructions or "").strip()]
 	if include_schema and schema:
-		parts.append(f"{SCHEMA_HEADER}\n{compact_json(schema)}")
+		# Data set values never go in the prompt (there can be millions); the field says where they come from.
+		shown = prompt_schema(schema, dataset_names or {}) if referenced_ids(schema) else schema
+		parts.append(f"{SCHEMA_HEADER}\n{compact_json(shown)}")
 	return "\n\n".join(p for p in parts if p)
 
 

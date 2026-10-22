@@ -24,3 +24,21 @@ export async function uploadImage(pid, blob) {
 
 export const imageUrl = (pid, name) => `/api/projects/${encodeURIComponent(pid)}/images/${encodeURIComponent(name)}`;
 export const runImageUrl = (pid, runId, name) => `/api/projects/${encodeURIComponent(pid)}/runs/${encodeURIComponent(runId)}/images/${encodeURIComponent(name)}`;
+
+// Upload a file as the raw request body with progress (fetch can't report upload progress).
+export function uploadFile(url, file, onProgress, method = "POST") {
+	return new Promise((resolve, reject) => {
+		const xhr = new XMLHttpRequest();
+		xhr.open(method, "/api" + url);
+		xhr.setRequestHeader("Content-Type", "application/octet-stream");
+		xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
+		xhr.onload = () => {
+			let data = {};
+			try { data = JSON.parse(xhr.responseText || "{}"); } catch { /* not JSON */ }
+			if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+			else reject(new Error(typeof data.detail === "string" ? data.detail : `${xhr.status} ${xhr.statusText}`));
+		};
+		xhr.onerror = () => reject(new Error("The upload was interrupted."));
+		xhr.send(file);
+	});
+}

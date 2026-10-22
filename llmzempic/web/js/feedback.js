@@ -41,6 +41,27 @@ export function confirmAction({ title, text, action, danger = false }) {
 	});
 }
 
+// A blocking dialog for long work (uploads, imports, copies). The bar runs indeterminate until
+// progress(share) reports a fraction, and again once it reaches 1 while the server finishes.
+export function progressDialog(title, text) {
+	const bar = h("span", {});
+	const track = h("div", { class: "progress indeterminate" }, bar);
+	const label = h("p", { class: "muted small" }, text);
+	const dlg = h("dialog", { class: "confirm" },
+		h("div", { class: "dialog-head" }, h("div", { class: "stack grow" }, h("h2", {}, title), track, label)));
+	dlg.addEventListener("cancel", (e) => e.preventDefault());
+	document.body.append(dlg);
+	dlg.showModal();
+	return {
+		text: (value) => { label.textContent = value; },
+		progress: (share) => {
+			track.classList.toggle("indeterminate", share >= 1);
+			bar.style.width = share >= 1 ? "" : `${Math.round(share * 100)}%`;
+		},
+		close: () => { dlg.close(); dlg.remove(); },
+	};
+}
+
 // Debounced saves keyed by kind; flushed before switching project or starting a job.
 export const saver = {
 	timers: {},

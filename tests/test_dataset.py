@@ -1,101 +1,20 @@
-from llmzempic.dataset import dataset_stats, split_examples
+from llmzempic.dataset import input_key, split_examples, split_keys
 from llmzempic.schema_tools import TEMPLATES
 
-JUNK_OUTPUTS = [None, "not json", 7, [], ["a"], {"label": None}, {"tags": "urgent"}, {"tags": [{"x": 1}, None]}, {"is_spam": 1}]
-
-
-def counts(stats, field):
-	entry = next(f for f in stats["fields"] if f["field"] == field)
-	return {f"{v['value']}": v["count"] for v in entry["values"]}
-
-
-def test_every_template_handles_junk_outputs():
-	examples = [{"id": str(i), "input": f"text {i}", "output": out} for i, out in enumerate(JUNK_OUTPUTS)]
-	for template in TEMPLATES:
-		stats = dataset_stats(examples, template["schema"])
-		assert stats["count"] == len(examples), template["id"]
-		assert stats["duplicates"] == []
-		for field in stats["fields"]:
-			assert all(v["count"] == 0 for v in field["values"]), (template["id"], field)
-
-
-def test_label_fields_by_kind():
-	stats = dataset_stats([], next(t for t in TEMPLATES if t["id"] == "file-analysis")["schema"])
-	assert [(f["field"], f["kind"]) for f in stats["fields"]] == [("file_type", "enum")]
-	stats = dataset_stats([], next(t for t in TEMPLATES if t["id"] == "extraction")["schema"])
-	assert stats["fields"] == []
-
-
-def test_enum_counts_include_unseen_labels():
-	schema = next(t for t in TEMPLATES if t["id"] == "classification")["schema"]
-	examples = [
-		{"id": "1", "input": "a", "output": {"label": "billing"}},
-		{"id": "2", "input": "b", "output": {"label": "billing"}},
-		{"id": "3", "input": "c", "output": {"label": "technical"}},
-		{"id": "4", "input": "d", "output": {"label": "made-up"}},
-	]
-	assert counts(dataset_stats(examples, schema), "label") == {"billing": 2, "technical": 1, "account": 0, "other": 0}
-
-
-def test_tags_counted_once_per_example():
-	schema = next(t for t in TEMPLATES if t["id"] == "multilabel")["schema"]
-	examples = [
-		{"id": "1", "input": "a", "output": {"tags": ["urgent", "urgent", "question"]}},
-		{"id": "2", "input": "b", "output": {"tags": ["urgent"]}},
-	]
-	stats = dataset_stats(examples, schema)
-	assert stats["fields"][0]["kind"] == "tags"
-	assert counts(stats, "tags") == {"urgent": 2, "complaint": 0, "question": 1, "feedback": 0}
-
-
-def test_booleans_and_nullable_enums_keep_types_apart():
-	schema = {
-		"type": "object",
-		"properties": {
-			"is_spam": {"type": "boolean"},
-			"level": {"type": ["integer", "null"], "enum": [1, 2, None]},
-		},
-	}
-	examples = [
-		{"id": "1", "input": "a", "output": {"is_spam": True, "level": 1}},
-		{"id": "2", "input": "b", "output": {"is_spam": 1, "level": True}},
-		{"id": "3", "input": "c", "output": {"is_spam": False, "level": None}},
-	]
-	stats = dataset_stats(examples, schema)
-	assert counts(stats, "is_spam") == {"True": 1, "False": 1}
-	assert counts(stats, "level") == {"1": 1, "2": 0, "None": 1}
-
-
-def test_invalid_schema_still_reports_duplicates():
-	examples = [{"id": "1", "input": "same", "output": 1}, {"id": "2", "input": "same", "output": 1}]
-	stats = dataset_stats(examples, {"type": "nonsense"})
-	assert stats["fields"] == []
-	assert stats["duplicates"] == [{"ids": ["1", "2"], "conflict": False}]
-
-
-def test_duplicates_normalize_whitespace_and_flag_conflicts():
-	examples = [
-		{"id": "1", "input": "Refund  my\norder", "output": {"label": "billing", "x": 1}},
-		{"id": "2", "input": " Refund my order ", "output": {"x": 1, "label": "billing"}},
-		{"id": "3", "input": "Login fails", "output": {"label": "technical"}},
-		{"id": "4", "input": "Login fails", "output": {"label": "account"}},
-		{"id": "5", "input": "login fails", "output": {"label": "account"}},
-		{"id": "6", "input": "  ", "output": {"label": "other"}},
-		{"id": "7", "input": "", "output": {"label": "other"}},
-	]
-	stats = dataset_stats(examples, {"type": "object"})
-	assert stats["duplicates"] == [
-		{"ids": ["1", "2"], "conflict": False},
-		{"ids": ["3", "4"], "conflict": True},
-	]
-
-
 CLASSIFY = next(t for t in TEMPLATES if t["id"] == "classification")["schema"]
+CODES = {"type": "object", "properties": {"b": {"type": "array", "items": {"type": "string", "x-dataset": "codes"}}}}
 
 
 def labeled(n_billing, n_technical):
 	labels = ["billing"] * n_billing + ["technical"] * n_technical
 	return [{"id": str(i), "input": f"ticket {i}", "output": {"label": label}} for i, label in enumerate(labels)]
+
+
+def split(rows, schema, fraction, seed, **kwargs):
+	"""Split, then map ids back to rows so assertions can look at them."""
+	by_id = {r["id"]: r for r in rows}
+	train, held_out, info = split_examples(split_keys(rows, schema), schema, fraction, seed, **kwargs)
+	return [by_id[i] for i in train], [by_id[i] for i in held_out], info
 
 
 def ids(rows):
@@ -104,8 +23,8 @@ def ids(rows):
 
 def test_split_is_stratified_by_label():
 	for seed in range(5):
-		train, held_out, info = split_examples(labeled(70, 30), CLASSIFY, 0.2, seed)
-		assert info == {"stratified_by": "label", "groups": 100}
+		train, held_out, info = split(labeled(70, 30), CLASSIFY, 0.2, seed)
+		assert info == {"stratified_by": "label", "groups": 100, "protected": 0, "sampled_out": 0}
 		assert len(held_out) == 20 and len(train) == 80
 		counts = {label: sum(r["output"]["label"] == label for r in held_out) for label in ("billing", "technical")}
 		assert 13 <= counts["billing"] <= 15 and 5 <= counts["technical"] <= 7, counts
@@ -117,7 +36,7 @@ def test_split_keeps_copies_together():
 		examples.append({"id": f"copy{i}", "input": f"  ticket\n{i} ", "output": examples[i]["output"]})
 		examples.append({"id": f"conflict{i}", "input": f"ticket {i}", "output": {"label": "other"}})
 	for seed in range(10):
-		train, held_out, info = split_examples(examples, CLASSIFY, 0.25, seed)
+		train, held_out, info = split(examples, CLASSIFY, 0.25, seed)
 		assert info["groups"] == 40
 		assert len(train) + len(held_out) == len(examples)
 		train_inputs = {" ".join(r["input"].split()) for r in train}
@@ -126,26 +45,25 @@ def test_split_keeps_copies_together():
 
 def test_split_is_deterministic_per_seed():
 	examples = labeled(30, 30)
-	first = split_examples(examples, CLASSIFY, 0.2, 7)
-	assert [r["id"] for r in first[1]] == [r["id"] for r in split_examples(examples, CLASSIFY, 0.2, 7)[1]]
-	assert ids(first[1]) != ids(split_examples(examples, CLASSIFY, 0.2, 8)[1])
+	first = split(examples, CLASSIFY, 0.2, 7)
+	assert [r["id"] for r in first[1]] == [r["id"] for r in split(examples, CLASSIFY, 0.2, 7)[1]]
+	assert ids(first[1]) != ids(split(examples, CLASSIFY, 0.2, 8)[1])
 
 
 def test_split_edge_cases():
-	assert split_examples(labeled(5, 4), CLASSIFY, 0.5, 1)[1] == []
-	assert split_examples(labeled(10, 10), CLASSIFY, 0, 1)[1] == []
-	train, held_out, _ = split_examples(labeled(10, 10), CLASSIFY, 1.0, 1)
+	assert split(labeled(5, 4), CLASSIFY, 0.5, 1)[1] == []
+	assert split(labeled(10, 10), CLASSIFY, 0, 1)[1] == []
+	train, held_out, _ = split(labeled(10, 10), CLASSIFY, 1.0, 1)
 	assert len(train) >= 1 and len(train) + len(held_out) == 20
 	extraction = next(t for t in TEMPLATES if t["id"] == "extraction")["schema"]
-	assert split_examples(labeled(10, 10), extraction, 0.1, 1)[2]["stratified_by"] is None
-	assert len(split_examples(labeled(10, 10), {"type": "nonsense"}, 0.1, 1)[1]) == 2
+	assert split(labeled(10, 10), extraction, 0.1, 1)[2]["stratified_by"] is None
+	assert len(split(labeled(10, 10), {"type": "nonsense"}, 0.1, 1)[1]) == 2
 	pairs = [{"id": f"{i}{c}", "input": f"t{i}", "output": {"label": "billing"}} for i in range(6) for c in "ab"]
-	held_out = split_examples(pairs, CLASSIFY, 0.1, 1)[1]
+	held_out = split(pairs, CLASSIFY, 0.1, 1)[1]
 	assert len(held_out) == 2 and held_out[0]["input"] == held_out[1]["input"]
 	big = labeled(20, 20) + [{"id": f"c{i}", "input": "same", "output": {"label": "billing"}} for i in range(10)]
 	for seed in range(20):
-		assert len(split_examples(big, CLASSIFY, 0.1, seed)[1]) == 5
-
+		assert len(split(big, CLASSIFY, 0.1, seed)[1]) == 5
 
 
 def test_image_examples_are_the_same_input_only_with_the_same_image_and_text():
@@ -155,5 +73,59 @@ def test_image_examples_are_the_same_input_only_with_the_same_image_and_text():
 		{"id": "3", "input": "", "image": "b.jpg", "output": {"label": "billing"}},
 		{"id": "4", "input": "close up", "image": "a.jpg", "output": {"label": "billing"}},
 	]
-	assert dataset_stats(examples, CLASSIFY)["duplicates"] == [{"ids": ["1", "2"], "conflict": True}]
-	assert split_examples(examples, CLASSIFY, 0.5, 1)[2]["groups"] == 3
+	assert split(examples, CLASSIFY, 0.5, 1)[2]["groups"] == 3
+
+
+def values_in(rows):
+	return {v for r in rows for v in r["output"]["b"]}
+
+
+def test_rare_values_never_held_out():
+	rows = [{"id": f"u{i}", "input": f"rare {i}", "output": {"b": [f"U{i}", "C"]}} for i in range(10)]
+	rows += [{"id": f"r{i}", "input": f"common {i}", "output": {"b": [f"P{i % 5}"]}} for i in range(30)]
+	for seed in range(10):
+		train, held_out, info = split(rows, CODES, 0.5, seed)
+		assert len(held_out) == 20
+		assert not any(v.startswith("U") for v in values_in(held_out))
+		assert values_in(train) == values_in(rows)
+		assert info["protected"] == 10
+
+
+def test_held_out_max_caps():
+	rows = [{"id": str(i), "input": f"t{i}", "output": {"label": "billing"}} for i in range(5000)]
+	assert len(split(rows, CLASSIFY, 0.5, 1, held_out_max=300)[1]) == 300
+	assert len(split(rows, CLASSIFY, 0.5, 1)[1]) == 300
+
+
+def test_sampling_keeps_every_value():
+	rows = [{"id": str(i), "input": f"t{i}", "output": {"b": [f"V{i % 50}"] + ([f"U{i}"] if i < 30 else [])}} for i in range(1000)]
+	for seed in range(5):
+		train, held_out, info = split(rows, CODES, 0.1, seed, max_examples=100)
+		assert len(train) + len(held_out) == 100
+		assert info["sampled_out"] == 900
+		assert values_in(train) == values_in(rows)
+
+
+def test_sampling_never_drops_below_the_protected_examples():
+	rows = [{"id": str(i), "input": f"t{i}", "output": {"b": [f"U{i}"]}} for i in range(40)]
+	train, held_out, info = split(rows, CODES, 0.1, 1, max_examples=10)
+	assert len(train) == 40 and held_out == [] and info["sampled_out"] == 0
+
+
+
+def test_sampling_leaves_examples_to_score():
+	# Most values are rare, so sampling can only drop rows of the common value; it must not drop every
+	# row that could be held out, or the run would have nothing to score.
+	rows = [{"id": f"u{i}", "input": f"rare {i}", "output": {"b": [f"U{i}"]}} for i in range(90)]
+	rows += [{"id": f"c{i}", "input": f"common {i}", "output": {"b": ["C"]}} for i in range(20)]
+	for seed in range(5):
+		train, held_out, info = split(rows, CODES, 0.1, seed, max_examples=50)
+		assert held_out and all(r["id"].startswith("c") for r in held_out)
+		assert values_in(train) == values_in(rows)
+
+def test_input_key_is_a_short_digest_that_ignores_whitespace():
+	text = "word " * 2000
+	assert input_key({"input": text}) == input_key({"input": "  " + text.replace(" ", "\n")})
+	assert len(input_key({"input": text})) <= 64
+	assert input_key({"input": "  "}) == ""
+	assert input_key({"input": "a", "image": "x.png"}) != input_key({"input": "a"})

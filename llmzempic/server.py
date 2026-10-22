@@ -7,23 +7,31 @@ import sys
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import Body, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, hardware
-from .data import parse_examples
-from .dataset import dataset_stats
+from .checks import Checker
+from .data import InvalidExample
+from .dataset_api import dataset_router
+from .example_api import example_router
+from .package_api import package_router
 from .fileio import read_json, tail_text
 from .image_api import image_router
 from .jobs import JobBusy, JobManager, job_paths, mark_interrupted
+from .datasets import run_resolver
 from .metrics import label_breakdown
+from .ref_metrics import ref_scores
 from .prompts import build_system_prompt
 from .runs import (
 	GGUF_TYPES, RunError, create_run, list_export_files, model_name, prepare_export, prepare_prediction,
-	read_events, run_summary, validate_examples,
+	read_events, run_summary,
 )
-from .schema_tools import TEMPLATES, check_schema, infer_schema
+from .refs import export_contract, referenced_ids
+from .schema_tools import TEMPLATES, check_schema
 from .snippets import all_snippets
 from .workspace import PRESETS, Workspace, load_catalog
 
@@ -51,10 +59,18 @@ class HardwareCache:
 			return self._info
 
 
+def cross_site(request):
+	if request.headers.get("sec-fetch-site") == "cross-site":
+		return True
+	origin = request.headers.get("origin")
+	return origin is not None and urlsplit(origin).netloc != request.headers.get("host")
+
+
 def create_app(workspace=None, jobs=None, hw_cache=None):
 	ws = workspace or Workspace()
 	jobs = jobs or JobManager()
 	hw_cache = hw_cache or HardwareCache()
+	checker = Checker()
 	mark_interrupted(ws)
 	# Warm the hardware probe in the background; the first page load would otherwise wait on it.
 	threading.Thread(target=hw_cache.get, daemon=True).start()
@@ -67,6 +83,18 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 	app = FastAPI(title="Llmzempic", version=__version__, lifespan=lifespan)
 	app.state.workspace = ws
 	app.state.jobs = jobs
+
+	@app.exception_handler(InvalidExample)
+	async def invalid_example(request, error):
+		return JSONResponse({"detail": str(error)}, status_code=400)
+
+	@app.middleware("http")
+	async def same_site_only(request, call_next):
+		# There is no login, and a page on another site can send "simple" cross-origin POSTs (raw
+		# uploads included) to localhost. Only this app's own pages may change anything.
+		if request.method not in ("GET", "HEAD", "OPTIONS") and cross_site(request):
+			return JSONResponse({"detail": "Requests from other sites are refused."}, status_code=403)
+		return await call_next(request)
 
 	def project_or_404(project_id):
 		try:
@@ -90,23 +118,15 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 
 	def project_view(project):
 		config = project.load_config()
+		names = {m["id"]: m["name"] for m in ws.library.list()}
+		missing = sorted(i for i in referenced_ids(config["schema"]) if i not in names)
 		return {
 			"id": project.id,
 			"config": config,
-			"schema_errors": check_schema(config["schema"]),
+			"schema_errors": check_schema(config["schema"]) + [f'Data set "{i}" no longer exists.' for i in missing],
 			"system_prompt": build_system_prompt(
-				config.get("instructions", ""), config["schema"], config.get("include_schema_in_prompt", True)
+				config.get("instructions", ""), config["schema"], config.get("include_schema_in_prompt", True), names
 			),
-		}
-
-	def examples_view(project, warnings=None):
-		config = project.load_config()
-		examples = project.load_examples()
-		return {
-			"examples": examples,
-			"invalid": validate_examples(examples, config["schema"], config.get("input_kind", "text"), project.images_dir),
-			"stats": dataset_stats(examples, config["schema"]),
-			"warnings": warnings or [],
 		}
 
 	@app.get("/api/system")
@@ -187,41 +207,6 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		ws.delete(project.id)
 		return {"ok": True}
 
-	@app.get("/api/projects/{project_id}/examples")
-	def get_examples(project_id: str):
-		return examples_view(project_or_404(project_id))
-
-	@app.put("/api/projects/{project_id}/examples")
-	def put_examples(project_id: str, payload: dict = Body(...)):
-		project = project_or_404(project_id)
-		examples = payload.get("examples")
-		if not isinstance(examples, list):
-			raise HTTPException(400, "Expected a list of examples.")
-		project.save_examples(examples)
-		return examples_view(project)
-
-	@app.post("/api/projects/{project_id}/import")
-	def import_examples(project_id: str, payload: dict = Body(...)):
-		project = project_or_404(project_id)
-		config = project.load_config()
-		try:
-			parsed, warnings = parse_examples(str(payload.get("text") or ""), str(payload.get("filename") or ""), config["schema"])
-		except ValueError as e:
-			raise HTTPException(400, f"Could not read the file: {e}")
-		if not parsed:
-			raise HTTPException(400, "; ".join(warnings[:5]) or "No examples found in the file.")
-		existing = [] if payload.get("mode") == "replace" else project.load_examples()
-		project.save_examples(existing + parsed)
-		return {**examples_view(project, warnings), "imported": len(parsed)}
-
-	@app.post("/api/projects/{project_id}/infer-schema")
-	def infer(project_id: str):
-		project = project_or_404(project_id)
-		outputs = [e["output"] for e in project.load_examples()]
-		if not outputs:
-			raise HTTPException(400, "Add some examples first; the schema is inferred from their outputs.")
-		return {"schema": infer_schema(outputs)}
-
 	@app.get("/api/projects/{project_id}/runs")
 	def list_runs(project_id: str):
 		project = project_or_404(project_id)
@@ -240,7 +225,7 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 			missing = ", ".join(hw["missing_image_packages"])
 			raise HTTPException(400, f"Image projects need {missing}. Run the setup script, then restart.")
 		try:
-			run_dir = create_run(project)
+			run_dir = create_run(project, ws.library, checker)
 		except RunError as e:
 			raise HTTPException(400, str(e))
 		try:
@@ -257,8 +242,11 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		if evaluation and evaluation.get("items"):
 			schema = (read_json(run_dir / "run.json", {}) or {}).get("schema")
 			evaluation["labels"] = label_breakdown(evaluation["items"], schema)
+			evaluation["refs"] = ref_scores(evaluation["items"], schema, run_resolver(run_dir))
+		skipped = read_json(run_dir / "skipped.json", None)
 		return {
 			**run_summary(run_dir),
+			"skipped_examples": {"max_length": skipped["max_length"], "ids": skipped["ids"][:100]} if skipped else None,
 			"events": read_events(run_dir, since),
 			"log": tail_text(job_paths("train", run_dir)[1]),
 			"export_log": tail_text(job_paths("export", run_dir)[1]),
@@ -286,6 +274,17 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 	def stop_run(project_id: str, run_id: str):
 		run_dir = run_or_404(project_or_404(project_id), run_id)
 		return {"stopped": jobs.stop(run_dir)}
+
+	@app.post("/api/projects/{project_id}/runs/{run_id}/resume")
+	def resume_run(project_id: str, run_id: str):
+		run_dir = run_or_404(project_or_404(project_id), run_id)
+		if not run_summary(run_dir)["resumable"]:
+			raise HTTPException(409, "Only stopped or failed runs with a saved checkpoint can resume.")
+		try:
+			jobs.start("train", run_dir, job_env())
+		except JobBusy as e:
+			raise HTTPException(409, str(e))
+		return run_summary(run_dir)
 
 	@app.post("/api/projects/{project_id}/runs/{run_id}/export")
 	def export_run(project_id: str, run_id: str, payload: dict = Body(...)):
@@ -330,11 +329,14 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		export_status = read_json(run_dir / "export" / "status.json", {}) or {}
 		name = options.get("ollama_name") or model_name(spec)
 		manifest = read_json(run_dir / "export" / "llmzempic.json", {}) or {}
+		schema, refs = export_contract(spec["schema"], spec.get("datasets"))
 		return {
 			"name": name,
+			"datasets": refs,
 			"snippets": all_snippets(
-				name, spec["schema"], spec["system_prompt"], export_status.get("gguf"), manifest.get("context_size", 4096),
+				name, schema, spec["system_prompt"], export_status.get("gguf"), manifest.get("context_size", 4096),
 				vision=spec.get("input_kind") == "image", mmproj_file=export_status.get("mmproj"), image_tokens=manifest.get("image_max_tokens"),
+				refs=refs,
 			),
 		}
 
@@ -354,5 +356,8 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		return {"path": str(target)}
 
 	app.include_router(image_router(project_or_404, run_or_404))
+	app.include_router(example_router(ws, project_or_404, checker))
+	app.include_router(dataset_router(ws, checker))
+	app.include_router(package_router(ws, project_or_404, project_view))
 	app.mount("/", WebFiles(directory=str(WEB_DIR), html=True), name="web")
 	return app

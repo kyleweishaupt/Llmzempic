@@ -144,6 +144,13 @@ export function renderExport() {
 		renderExport();
 	});
 	const snippetBox = h("div", { class: "stack" });
+	const sets = Object.values(run.datasets || {}).map((d) => d.name);
+	const serve = run.input_kind === "image"
+		? "Serve the GGUF and its image encoder (the mmproj file) with Ollama or llama.cpp's llama-server, then send each image with the request."
+		: "Serve the GGUF with Ollama or llama.cpp's llama-server, then call it over HTTP.";
+	const guarantee = sets.length
+		? ` The clients call llama-server started with grammar.gbnf, so data set fields only answer with values from ${sets.join(" and ")}. Ollama can't enforce lists that long; with it, turn on the clients' value check, which raises an error naming any value that isn't on its list.`
+		: " The clients pass the schema so the server constrains output to valid JSON.";
 	mount(pane, h("div", { class: "export-grid" },
 		h("div", { class: "stack-lg" },
 			field("Run", select),
@@ -154,9 +161,7 @@ export function renderExport() {
 			filesCard(run),
 			h("section", { class: "stack" },
 				h("h2", { class: "section-title" }, "Use it from your code"),
-				h("p", { class: "muted" }, run.input_kind === "image"
-					? "Serve the GGUF and its image encoder (the mmproj file) with Ollama or llama.cpp's llama-server, then send each image with the request. The clients pass the schema so the server constrains output to valid JSON."
-					: "Serve the GGUF with Ollama or llama.cpp's llama-server, then call it over HTTP. The clients pass the schema so the server constrains output to valid JSON."),
+				h("p", { class: "muted" }, serve + guarantee),
 				snippetBox,
 			),
 		),

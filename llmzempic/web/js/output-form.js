@@ -1,4 +1,5 @@
 import { button, h, icon, mount, preserveFocus, seg } from "./dom.js";
+import { refPicker } from "./ref-picker.js";
 import { blankValue, labelFields } from "./schema-model.js";
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -48,6 +49,10 @@ export function outputForm(root, value, onChange, { labelsOnly = false, keyPrefi
 			return choiceControl(node, current, (v) => { set(v); rerender(); }, label);
 		}
 		if (node.kind === "tags") return tagControl(node, current, (v) => { set(v); rerender(); }, label);
+		if (node.kind === "dataset") return refPicker({ dataset: node.dataset, value: current, onChange: set, label });
+		if (node.kind === "list" && node.item && node.item.kind === "dataset") {
+			return refPicker({ dataset: node.item.dataset, value: current, list: true, max: node.maxItems, onChange: set, label });
+		}
 		if (node.kind === "text") {
 			const input = h("textarea", { rows: 1, value: typeof current === "string" ? current : current == null ? "" : JSON.stringify(current), "data-focus": key, "aria-label": label, placeholder: node.description || "" });
 			input.addEventListener("input", () => set(input.value === "" && node.nullable ? null : input.value));
@@ -103,7 +108,7 @@ export function outputForm(root, value, onChange, { labelsOnly = false, keyPrefi
 				else obj[f.name] = v;
 				onChange(value);
 			};
-			const wide = ["text", "object", "list", "tags"].includes(f.kind);
+			const wide = ["text", "object", "list", "tags", "dataset"].includes(f.kind);
 			return h("div", { class: wide ? "of-field wide" : "of-field" },
 				h("span", { class: "of-label", title: f.description || null }, f.name, f.required ? null : h("span", { class: "faint" }, " optional")),
 				h("div", { class: "of-control" }, control(f, () => obj[f.name], set, `${path}.${f.name}`, f.name)),

@@ -1,8 +1,17 @@
+import importlib.util
 import inspect
+import io
 import json
+import re
+import shutil
+import subprocess
 
-from llmzempic.exporter import context_size, modelfile_text, write_deploy_files
+import pytest
+
+from llmzempic.datasets import Library, run_resolver
+from llmzempic.exporter import context_size, modelfile_text, write_deploy_files, write_value_files
 from llmzempic.fileio import write_jsonl
+from llmzempic.refs import prompt_schema
 from llmzempic.snippets import all_snippets, csharp_client, pascal, snake
 
 SCHEMA = {
@@ -123,3 +132,118 @@ def test_write_deploy_files(tmp_path):
 	request = json.loads((tmp_path / "integration" / "llama-server-request.json").read_text(encoding="utf-8"))
 	assert request["messages"][0]["content"] == SPEC["system_prompt"]
 	assert request["response_format"]["json_schema"]["schema"] == SCHEMA
+
+
+CODES = {"type": "string", "x-dataset": "codes"}
+REF_SCHEMA = {
+	"type": "object",
+	"properties": {
+		"primary": {"type": "array", "items": CODES, "maxItems": 1},
+		"supporting": {"type": "array", "items": CODES, "maxItems": 5},
+	},
+	"required": ["primary", "supporting"],
+	"additionalProperties": False,
+}
+REF_SPEC = {**SPEC, "schema": REF_SCHEMA, "datasets": {"codes": {"name": "Codes", "hash": "h", "rows": 3}}}
+
+
+def ref_export(tmp_path):
+	"""Export files for a run whose schema draws on a three-value data set."""
+	source = tmp_path / "codes.txt"
+	source.write_text("A00\nA01\nB1\n", encoding="utf-8")
+	library = Library(tmp_path / "library")
+	library.create("Codes", source, "codes.txt")
+	run_dir = tmp_path / "run"
+	library.get("codes").copy_to(run_dir / "datasets" / "codes")
+	export_dir = run_dir / "export"
+	write_deploy_files(export_dir, REF_SPEC, "coder", "coder-q8_0.gguf", 4096, None)
+	write_value_files(export_dir, REF_SPEC, run_resolver(run_dir))
+	return export_dir
+
+
+def test_export_ships_lists_and_manifest(tmp_path):
+	export_dir = ref_export(tmp_path)
+	assert (export_dir / "datasets" / "codes.txt").read_text(encoding="utf-8").splitlines() == ["A00", "A01", "B1"]
+	manifest = json.loads((export_dir / "llmzempic.json").read_text(encoding="utf-8"))
+	assert manifest["datasets"] == [
+		{"path": ["primary", "*"], "file": "datasets/codes.txt", "name": "Codes"},
+		{"path": ["supporting", "*"], "file": "datasets/codes.txt", "name": "Codes"},
+	]
+	assert manifest["grammar"] == "grammar.gbnf"
+	assert manifest["schema"] == prompt_schema(REF_SCHEMA, {"codes": "Codes"})
+
+
+def test_schema_json_matches_spike_path(tmp_path):
+	# Decision B: the values live in a prefix-tree grammar llama-server loads once, never in the schema or a request.
+	export_dir = ref_export(tmp_path)
+	shipped = (export_dir / "schema.json").read_text(encoding="utf-8")
+	assert json.loads(shipped) == prompt_schema(REF_SCHEMA, {"codes": "Codes"})
+	assert "A01" not in shipped and "x-dataset" not in shipped
+	assert '"A0" ' in (export_dir / "grammar.gbnf").read_text(encoding="utf-8")
+	request = json.loads((export_dir / "integration" / "llama-server-request.json").read_text(encoding="utf-8"))
+	assert "response_format" not in request
+	assert "--grammar-file grammar.gbnf" in (export_dir / "README.md").read_text(encoding="utf-8")
+
+
+def load_client(path):
+	spec = importlib.util.spec_from_file_location(path.stem, path)
+	module = importlib.util.module_from_spec(spec)
+	spec.loader.exec_module(module)
+	return module
+
+
+def test_clients_validate_values(tmp_path, monkeypatch):
+	# Spec: llama-server is the runtime that enforces the lists, so data set clients call it by default.
+	export_dir = ref_export(tmp_path)
+	client = load_client(export_dir / "integration" / "coder_client.py")
+	answer, sent = {}, []
+
+	def reply(request, timeout):
+		sent.append((request.full_url, json.loads(request.data)))
+		return io.BytesIO(json.dumps({"choices": [{"message": {"content": json.dumps(answer)}}]}).encode())
+
+	monkeypatch.setattr(client.urllib.request, "urlopen", reply)
+	answer.update(primary=["A00"], supporting=["B1", "ZZ9"])
+	with pytest.raises(ValueError, match=re.escape('supporting/1: "ZZ9" isn\'t in data set Codes')):
+		client.coder("Text", check=True)
+	url, payload = sent[0]
+	assert url == "http://localhost:8080/v1/chat/completions" and "response_format" not in payload
+	assert payload["messages"] == [{"role": "system", "content": REF_SPEC["system_prompt"]}, {"role": "user", "content": "Text"}]
+	assert client.coder("Text") == answer  # the grammar already enforces the lists; checking is opt-in
+	answer.update(supporting=["B1", "A01"])
+	assert client.coder("Text", check=True) == {"primary": ["A00"], "supporting": ["B1", "A01"]}
+
+
+@pytest.mark.skipif(not shutil.which("php"), reason="php is not installed")
+def test_php_client_checks_values(tmp_path):
+	export_dir = ref_export(tmp_path)
+	client = export_dir / "integration" / "client.php"
+	result = subprocess.run(["php", "-l", str(client)], capture_output=True, text=True, timeout=60)
+	assert result.returncode == 0, result.stdout + result.stderr
+	script = tmp_path / "check.php"
+	script.write_text(
+		f"<?php require {json.dumps(str(client))};\n"
+		"coder_check_values(['primary' => ['A00'], 'supporting' => ['B1']]);\n"
+		"try { coder_check_values(['primary' => ['A00'], 'supporting' => ['B1', 'ZZ9']]); }\n"
+		"catch (UnexpectedValueException $e) { echo $e->getMessage(); }\n",
+		encoding="utf-8",
+	)
+	result = subprocess.run(["php", str(script)], capture_output=True, text=True, timeout=60)
+	assert result.stdout == 'supporting/1: "ZZ9" isn\'t in data set Codes', result.stdout + result.stderr
+
+
+@pytest.mark.skipif(not shutil.which("dotnet"), reason="dotnet is not installed")
+def test_csharp_client_with_values_builds(tmp_path):
+	export_dir = ref_export(tmp_path)
+	sdks = subprocess.run(["dotnet", "--list-sdks"], capture_output=True, text=True, timeout=60).stdout.split()
+	major = max(int(v.split(".")[0]) for v in sdks if re.match(r"\d+\.\d+\.\d+$", v))
+	project = tmp_path / "cs"
+	project.mkdir()
+	shutil.copy(export_dir / "integration" / "CoderClient.cs", project)
+	(project / "Check.csproj").write_text(
+		f'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net{major}.0</TargetFramework>'
+		"<Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup></Project>",
+		encoding="utf-8",
+	)
+	result = subprocess.run(["dotnet", "build", str(project), "-v", "q", "--nologo"], capture_output=True, text=True, timeout=300)
+	assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-2000:]

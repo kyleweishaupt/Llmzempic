@@ -94,3 +94,32 @@ class StatusFile:
 		self.data["updated"] = time.time()
 		write_json(self.path, self.data)
 		return self.data
+
+
+class JsonlRows:
+	"""Random access to a JSONL file without loading it: line offsets are indexed once, rows parsed on demand."""
+
+	def __init__(self, path):
+		self.path = Path(path)
+		self.offsets = []
+		if self.path.exists():
+			with open(self.path, "rb") as f:
+				offset = 0
+				for line in f:
+					if line.strip():
+						self.offsets.append(offset)
+					offset += len(line)
+
+	def __len__(self):
+		return len(self.offsets)
+
+	def __getitem__(self, index):
+		with open(self.path, "rb") as f:
+			f.seek(self.offsets[index])
+			return json.loads(f.readline().decode("utf-8"))
+
+	def __iter__(self):
+		with open(self.path, "r", encoding="utf-8") as f:
+			for line in f:
+				if line.strip():
+					yield json.loads(line)

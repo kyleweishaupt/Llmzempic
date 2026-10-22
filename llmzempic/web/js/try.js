@@ -1,10 +1,10 @@
 import { api, runImageUrl } from "./api.js";
 import { button, callout, h, icon, mount, pill } from "./dom.js";
 import { toast, toastError } from "./feedback.js";
-import { randomId } from "./format.js";
 import { imageFiles, uploadPrepared } from "./intake.js";
 import { jsonBlock } from "./json-view.js";
-import { scheduleExamplesSave } from "./project.js";
+import { addExamples } from "./example-ops.js";
+import { loadPage } from "./project.js";
 import { blankOutput } from "./schema-model.js";
 import { S, activeJob, app } from "./state.js";
 
@@ -65,10 +65,15 @@ async function runTry(run) {
 	}
 }
 
-function addAsExample(it, ok) {
-	S.examples.unshift({ id: randomId(), input: it.input || "", ...(it.image ? { image: it.image } : {}), output: ok ? structuredClone(it.value) : blankOutput(S.config.schema) });
-	S.page = 0;
-	scheduleExamplesSave();
+async function addAsExample(it, ok) {
+	try {
+		await addExamples([{ input: it.input || "", ...(it.image ? { image: it.image } : {}), output: ok ? structuredClone(it.value) : blankOutput(S.config.schema) }]);
+	} catch (e) {
+		toastError(e);
+		return;
+	}
+	S.query = { filter: "all", search: "", label: null, offset: 0 };
+	await loadPage();
 	app.renderStepper();
 	toast("Added as an example. Check its answer on the Examples tab, then train again.", false, { label: "Open", onclick: () => app.showTab("examples") });
 }

@@ -2,6 +2,8 @@ import { api } from "./api.js";
 import { $, $$, button, h, icon, menu, mount, pill, seg } from "./dom.js";
 import { confirmAction, saver, toastError } from "./feedback.js";
 import { duration, pct, plural, shortModel } from "./format.js";
+import { renderDatasets } from "./datasets.js";
+import { duplicateProject, exportPackageDialog, importPackage } from "./packages.js";
 import { loadProject, loadProjects, selectRun } from "./project.js";
 import { S, activeJob, app, catalogModel, hardware, isImageProject, problemCount } from "./state.js";
 import { applyTheme, currentTheme } from "./theme.js";
@@ -54,10 +56,11 @@ function hardwareLine() {
 }
 
 export function renderSidebar() {
+	$("#datasets-link").setAttribute("aria-current", S.screen === "datasets" ? "page" : "false");
 	const list = $("#project-list");
 	mount(list, S.projects.length
 		? S.projects.map(projectItem)
-		: h("p", { class: "side-empty" }, "No projects yet."));
+		: h("p", { class: "side-empty" }, S.projectsLoaded ? "No projects yet." : "Loading projects…"));
 	mount($("#job-slot"), jobCard());
 	mount($("#hw-slot"), hardwareLine());
 	mount($("#theme-slot"), seg([["system", null, "monitor"], ["light", null, "sun"], ["dark", null, "moon"]], currentTheme(),
@@ -80,9 +83,10 @@ function stepInfo(tab) {
 		return [S.config.instructions.trim() && fields ? "done" : "todo", plural(fields, "output field")];
 	}
 	if (tab === "examples") {
-		const n = S.examples.length;
+		const n = S.counts.all;
 		const bad = problemCount();
-		if (bad) return ["problem", `${bad} to fix`];
+		if (S.checking.running) return ["running", `Checking ${S.checking.done.toLocaleString()} of ${S.checking.total.toLocaleString()}`];
+		if (bad) return ["problem", `${bad.toLocaleString()} to fix`];
 		return [n >= 2 ? "done" : "todo", n ? plural(n, "example") : "None yet"];
 	}
 	if (tab === "model") {
@@ -120,6 +124,9 @@ export function renderProjectHead() {
 	mount($("#project-title"), S.config.name || S.pid);
 	mount($("#kind-slot"), pill(isImageProject() ? "Images" : "Text", "", { iconName: isImageProject() ? "image" : "text" }));
 	mount($("#project-menu"), menu(button(null, { icon: "more", kind: "ghost", title: "Project actions" }), [
+		{ label: "Export package…", icon: "download", onclick: exportPackageDialog },
+		{ label: "Duplicate project", icon: "copy", onclick: duplicateProject },
+		"-",
 		{ label: "Delete project", icon: "trash", danger: true, onclick: deleteProject },
 	]));
 }
@@ -164,15 +171,31 @@ export async function openProject(pid, tab, runId) {
 		toastError(e);
 		return;
 	}
+	S.screen = "project";
 	$("#welcome").hidden = true;
+	$("#datasets-page").hidden = true;
 	$("#project").hidden = false;
 	renderProjectHead();
 	renderSidebar();
 	showTab(tab || S.tab);
 }
 
-export function renderWelcome() {
+export async function openDatasets() {
+	await saver.flush();
+	Object.assign(S, { screen: "datasets", pid: null });
+	history.replaceState(null, "", "#datasets");
+	$("#welcome").hidden = true;
 	$("#project").hidden = true;
+	$("#datasets-page").hidden = false;
+	renderSidebar();
+	window.scrollTo(0, 0);
+	renderDatasets();
+}
+
+export function renderWelcome() {
+	S.screen = "welcome";
+	$("#project").hidden = true;
+	$("#datasets-page").hidden = true;
 	const el = $("#welcome");
 	el.hidden = false;
 	const steps = [
@@ -186,7 +209,9 @@ export function renderWelcome() {
 		h("div", { class: "welcome-hero" },
 			h("h1", {}, "Teach a small model to answer in your JSON"),
 			h("p", { class: "lede" }, "Describe a task, show it examples, and Llmzempic fine-tunes an open model on your machine into a specialist that returns the structure your code expects."),
-			button("New project", { kind: "primary", size: "lg", icon: "plus", onclick: () => app.newProject() }),
+			h("div", { class: "row" },
+				button("New project", { kind: "primary", size: "lg", icon: "plus", onclick: () => app.newProject() }),
+				button("Import a package", { kind: "secondary", size: "lg", icon: "upload", onclick: importPackage })),
 		),
 		h("ol", { class: "welcome-steps" }, steps.map(([title, text], i) => h("li", {},
 			h("span", { class: "step-mark" }, String(i + 1)), h("b", {}, title), h("span", { class: "muted" }, text)))),

@@ -1,9 +1,12 @@
 """JSON Schema helpers: validation, inference from examples, templates and CSV coercion."""
 
 import json
+from functools import lru_cache
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
+
+from .refs import ref_errors
 
 
 def compact_json(value):
@@ -14,17 +17,25 @@ def check_schema(schema):
 	"""Return a list of problems with the schema itself (empty when usable)."""
 	if not isinstance(schema, dict):
 		return ["The output structure must be a JSON Schema object."]
+	return list(_schema_problems(json.dumps(schema, sort_keys=True)))
+
+
+# Cached by content: checking a schema against the metaschema costs far more than validating an output.
+@lru_cache(maxsize=64)
+def _schema_problems(text):
+	schema = json.loads(text)
 	try:
 		Draft202012Validator.check_schema(schema)
 	except SchemaError as e:
-		return [f"Invalid JSON Schema: {e.message}"]
+		return (f"Invalid JSON Schema: {e.message}",)
 	if not schema:
-		return ["The schema is empty - describe the expected output structure."]
-	return []
+		return ("The schema is empty - describe the expected output structure.",)
+	return ()
 
 
-def validate_output(value, schema):
-	"""Validate one expected/generated output. Returns a list of readable errors."""
+def validate_output(value, schema, resolver=None):
+	"""Validate one expected/generated output. Returns a list of readable errors. With a resolver,
+	values in data set fields (refs.REF_KEY) are checked against their data sets too."""
 	if check_schema(schema):
 		return []
 	validator = Draft202012Validator(schema)
@@ -35,7 +46,9 @@ def validate_output(value, schema):
 		errors.append(f"{where}: {message}" if where else message)
 		if len(errors) >= 5:
 			break
-	return errors
+	if resolver is not None:
+		errors += ref_errors(value, schema, resolver)
+	return errors[:5]
 
 
 def _readable(err):

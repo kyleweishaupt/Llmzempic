@@ -25,6 +25,8 @@ const TRAINING_FIELDS = [
 	{ key: "grad_accum", label: "Gradient accumulation", step: 1, min: 1 },
 	{ key: "max_seq_length", label: "Max tokens per example", step: 64, min: 0, help: "0 fits the longest example." },
 	{ key: "eval_fraction", label: "Held-out share", step: 0.05, min: 0, help: "Kept aside for scoring (needs 10+ examples)." },
+	{ key: "eval_max", label: "Held-out examples to score", step: 50, min: 1, max: 2000, help: "Caps the held-out set; scoring each one takes a moment." },
+	{ key: "max_examples", label: "Use at most N examples (0 = all)", step: 1000, min: 0, help: "Trains on a sample. Values with few examples are always kept." },
 	{ key: "quantization", label: "Quantization", options: [["auto", "Auto"], ["4bit", "4-bit QLoRA"], ["none", "None (16-bit)"]] },
 	{ key: "accelerator", label: "Accelerator", options: [["auto", "Auto (Unsloth if installed)"], ["unsloth", "Unsloth"], ["off", "Standard PEFT"]], help: "Unsloth is used for text models only." },
 	{ key: "seed", label: "Random seed", step: 1, min: 0 },
@@ -97,9 +99,10 @@ function presetSection() {
 		const value = t[f.key];
 		const control = f.options
 			? h("select", {}, f.options.map(([v, label]) => h("option", { value: v, selected: v === value }, label)))
-			: h("input", { type: "number", step: f.step, min: f.min, value });
+			: h("input", { type: "number", step: f.step, min: f.min, max: f.max, value });
 		control.addEventListener("change", () => {
-			t[f.key] = f.options ? control.value : Number(control.value);
+			t[f.key] = f.options ? control.value : Math.min(f.max ?? Infinity, Math.max(f.min ?? -Infinity, Number(control.value)));
+			if (!f.options) control.value = t[f.key];
 			scheduleConfigSave();
 			mount($("#preset-cards"), presetCards());
 		});

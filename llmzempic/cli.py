@@ -23,20 +23,32 @@ def cmd_ui(args):
 
 
 def cmd_train(args):
+	from .checks import Checker
 	from .fileio import StatusFile
 	from .runs import create_run
 	from .trainer import run_training
 
-	project = Workspace(args.workspace).resolve(args.project)
-	run_dir = create_run(project)
+	ws = Workspace(args.workspace)
+	project = ws.resolve(args.project)
+	checker = Checker()
+	checker.ensure(project, ws.library)
+	checker.wait(project.id)
+	run_dir = create_run(project, ws.library, checker)
 	print(f"Run folder: {run_dir}")
 	status = StatusFile(run_dir / "status.json")
 	run_training(run_dir, status)
 	from .fileio import read_json
+	from .datasets import run_resolver
 	from .metrics import label_breakdown
+	from .ref_metrics import ref_scores
 	evaluation = read_json(run_dir / "eval.json", None) or {}
 	spec = read_json(run_dir / "run.json", {})
-	print(json.dumps({**(status.data.get("metrics") or {}), "labels": label_breakdown(evaluation.get("items") or [], spec.get("schema"))}, indent=2))
+	items = evaluation.get("items") or []
+	print(json.dumps({
+		**(status.data.get("metrics") or {}),
+		"labels": label_breakdown(items, spec.get("schema")),
+		"refs": ref_scores(items, spec.get("schema"), run_resolver(run_dir)),
+	}, indent=2))
 
 
 def cmd_try(args):
@@ -74,6 +86,27 @@ def cmd_export(args):
 	print(f"Exported to {export_dir}")
 
 
+def cmd_package(args):
+	from pathlib import Path
+
+	from .packages import export_package
+
+	ws = Workspace(args.workspace)
+	project = ws.resolve(args.project)
+	out = Path(args.out or f"{project.id}.llmz").expanduser()
+	export_package(ws, project, out, args.include_run)
+	print(f"Wrote {out}")
+
+
+def cmd_import_package(args):
+	from pathlib import Path
+
+	from .packages import import_package
+
+	project = import_package(Workspace(args.workspace), Path(args.file).expanduser())
+	print(f"Imported as project '{project.id}'")
+
+
 def cmd_doctor(args):
 	from .hardware import detect
 	print(json.dumps(detect(), indent=2))
@@ -108,6 +141,16 @@ def main(argv=None):
 	try_.add_argument("--image", action="append", metavar="PATH", help="Image file to answer (image runs; repeatable)")
 	try_.set_defaults(func=cmd_try)
 
+	package = sub.add_parser("package", help="Save a project (examples, images, data sets) as a .llmz file")
+	package.add_argument("project", help="Project id, name, or folder")
+	package.add_argument("--out", help="File to write (default: <project>.llmz)")
+	package.add_argument("--include-run", action="store_true", help="Also include the latest trained run")
+	package.set_defaults(func=cmd_package)
+
+	import_ = sub.add_parser("import-package", help="Create a project from a .llmz file")
+	import_.add_argument("file", help="Package file")
+	import_.set_defaults(func=cmd_import_package)
+
 	doctor = sub.add_parser("doctor", help="Show detected hardware and libraries")
 	doctor.set_defaults(func=cmd_doctor)
 
@@ -120,7 +163,7 @@ def main(argv=None):
 	except KeyboardInterrupt:
 		return 130
 	except Exception as e:  # surface run/setup errors without a traceback wall
-		if type(e).__name__ in ("RunError", "KeyError", "ImageError", "FileNotFoundError"):
+		if type(e).__name__ in ("RunError", "KeyError", "ImageError", "FileNotFoundError", "PackageError"):
 			print(f"error: {e}", file=sys.stderr)
 			return 1
 		raise

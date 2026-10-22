@@ -44,6 +44,7 @@ export const ICONS = {
 	layers: '<path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
 	expand: '<path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="m21 3-7 7"/><path d="m3 21 7-7"/>',
 	filter: '<path d="M22 3H2l8 9.46V19l4 2v-8.54Z"/>',
+	database: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/>',
 	"arrow-up": '<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',
 	"arrow-down": '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
 	square: '<rect width="18" height="18" x="3" y="3" rx="2"/>',

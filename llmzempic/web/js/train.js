@@ -9,12 +9,16 @@ import { S, activeJob, app, catalogModel, duplicateCounts, hardware, isImageProj
 function readiness() {
 	const hw = hardware();
 	const bad = problemCount();
-	const n = S.examples.length;
+	const n = S.counts.all;
 	const entry = catalogModel(S.config.base_model);
 	const fits = !entry || Boolean(entry.vision) === isImageProject();
 	const checks = [
 		[S.view.schema_errors.length === 0, "Output schema is valid", "Fix the output schema on the Task tab", "task"],
-		[n >= 2 && bad === 0, `${plural(n, "example")}, all valid`, n < 2 ? "Add at least 2 examples" : `Fix ${plural(bad, "example")} on the Examples tab`, "examples"],
+		S.checking.error
+			? [false, "", `Checking examples failed: ${S.checking.error}`, "examples"]
+			: S.checking.running || S.checking.done < S.checking.total
+			? [false, "", "Still checking examples. Start training when it finishes.", "examples"]
+			: [n >= 2 && bad === 0, `${plural(n, "example")}, all valid`, n < 2 ? "Add at least 2 examples" : `Fix ${plural(bad, "example")} on the Examples tab`, "examples"],
 		[Boolean(S.config.base_model) && fits, `Base model: ${entry ? entry.name : shortModel(S.config.base_model)}`,
 			!S.config.base_model ? "Choose a base model" : isImageProject() ? "Choose a vision model" : "Choose a text model", "model"],
 		[Boolean(hw && hw.can_train), "Training libraries installed",
@@ -34,6 +38,9 @@ function readiness() {
 		}
 		const { conflicts } = duplicateCounts();
 		if (conflicts) warnings.push(`${plural(conflicts, "input")} appear more than once with different answers; the model can't learn both.`);
+		if (S.stats.long_inputs) {
+			warnings.push(`About ${plural(S.stats.long_inputs, "example")} may be longer than the ${S.config.training.max_seq_length.toLocaleString()} token limit and would be skipped (Model tab, advanced settings).`);
+		}
 	}
 	if (hw && hw.device !== "cuda") warnings.push("No GPU: training is slow for models above about 0.5B parameters.");
 	return { ok: checks.every((c) => c[0]), checks, warnings };

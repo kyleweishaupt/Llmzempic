@@ -13,12 +13,12 @@ import shutil
 import time
 
 from . import vision
-from .fileio import append_jsonl, read_json, read_jsonl, write_json
+from .fileio import JsonlRows, append_jsonl, read_json, read_jsonl, write_json
 from .hardware import estimate_memory_gb
 from .metrics import score_predictions
 from .prompts import FALLBACK_CHAT_TEMPLATE, build_messages, format_output, render_chat, tokenize_example
+from .train_data import LazyFeatures, measure_lengths, select_within
 
-MAX_EVAL_EXAMPLES = 100
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
@@ -189,10 +189,6 @@ def load_unsloth(spec, plan):
 	return model, tokenizer
 
 
-def tokenize_rows(tokenizer, system_prompt, rows):
-	return [tokenize_example(tokenizer, system_prompt, r["input"], r["output"]) for r in rows]
-
-
 def generate(model, tokenizer, system_prompt, inputs, max_new_tokens, batch_size, torch):
 	tokenizer.padding_side = "left"
 	gen_config = getattr(model, "generation_config", None)
@@ -226,8 +222,8 @@ def run_training(run_dir, status):
 	os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 	spec = read_json(run_dir / "run.json")
 	t = spec["training"]
-	train_rows = read_jsonl(run_dir / "train.jsonl")
-	eval_rows = read_jsonl(run_dir / "eval.jsonl")
+	train_rows = JsonlRows(run_dir / "train.jsonl")  # can be hundreds of thousands of long rows
+	eval_rows = read_jsonl(run_dir / "eval.jsonl")  # capped at a few thousand by the split
 	system_prompt = spec["system_prompt"]
 	events_path = run_dir / "events.jsonl"
 
@@ -252,27 +248,39 @@ def run_training(run_dir, status):
 		tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
 	tokenizer.padding_side = "right"
 
+	max_len = int(t.get("max_seq_length") or 0)
 	if plan.vision:
 		status.update(stage="Preparing images")
 		images_dir = run_dir / "images"
-		train_features = vision.build_features(processor, system_prompt, train_rows, images_dir, log)
+		train_features = vision.build_features(processor, system_prompt, list(train_rows), images_dir, log)
 		eval_features = vision.build_features(processor, system_prompt, eval_rows, images_dir, log)
 		collator = vision.VisionCollator(processor, model)
+		if max_len:
+			before = len(train_features)
+			train_features = [f for f in train_features if feature_length(f) <= max_len]
+			eval_features = [f for f in eval_features if feature_length(f) <= max_len]
+			if len(train_features) < before:
+				log(f"Skipped {before - len(train_features)} training example(s) longer than {max_len} tokens.")
+		lengths = [feature_length(f) for f in train_features + eval_features]
+		answer_tokens = max(len(tokenizer(format_output(r["output"]), add_special_tokens=False)["input_ids"]) for r in list(train_rows) + eval_rows)
 	else:
-		status.update(stage="Tokenizing examples")
-		train_features = tokenize_rows(tokenizer, system_prompt, train_rows)
-		eval_features = tokenize_rows(tokenizer, system_prompt, eval_rows)
+		measured = measure_lengths(tokenizer, system_prompt, train_rows, 500,
+			lambda done, total: status.update(stage=f"Measuring examples ({done:,} of {total:,})"))
+		keep, skipped = select_within([n for n, _ in measured], max_len)
+		eval_measured = measure_lengths(tokenizer, system_prompt, eval_rows, 500, lambda done, total: None)
+		eval_keep, eval_skipped = select_within([n for n, _ in eval_measured], max_len)
+		if skipped or eval_skipped:
+			ids = [train_rows[i]["id"] for i in skipped] + [eval_rows[i]["id"] for i in eval_skipped]
+			write_json(run_dir / "skipped.json", {"max_length": max_len, "ids": ids})
+			log(f"Skipped {len(ids)} example(s) longer than {max_len} tokens; their ids are in skipped.json.")
+		train_features = LazyFeatures(train_rows, keep, tokenizer, system_prompt)
+		eval_features = [tokenize_example(tokenizer, system_prompt, eval_rows[i]["input"], eval_rows[i]["output"]) for i in eval_keep]
 		collator = PadCollator(tokenizer.pad_token_id, 8 if plan.cuda else None)
-	max_len = int(t.get("max_seq_length") or 0)
-	if max_len:
-		before = len(train_features)
-		train_features = [f for f in train_features if feature_length(f) <= max_len]
-		eval_features = [f for f in eval_features if feature_length(f) <= max_len]
-		if len(train_features) < before:
-			log(f"Skipped {before - len(train_features)} training example(s) longer than {max_len} tokens.")
-	if not train_features:
+		lengths = [measured[i][0] for i in keep] + [eval_measured[i][0] for i in eval_keep]
+		answer_tokens = max(a for _, a in measured + eval_measured)
+	if not len(train_features):
 		raise RuntimeError("Every training example is longer than the max sequence length.")
-	longest = max(feature_length(f) for f in train_features + eval_features)
+	longest = max(lengths)
 	log(f"{len(train_features)} training / {len(eval_features)} eval examples, longest {longest} tokens")
 	if longest > 4096:
 		log("Long examples use a lot of memory; lower the batch size if you run out of memory.")
@@ -301,7 +309,10 @@ def run_training(run_dir, status):
 		"max_grad_norm": 1.0,
 		"logging_steps": 1,
 		"logging_first_step": True,
-		"save_strategy": "no",
+		# Checkpoints let a long run resume after a crash or a stop; only the newest is kept.
+		"save_strategy": "steps",
+		"save_steps": max(50, total_steps // 10),
+		"save_total_limit": 1,
 		"eval_strategy": "epoch" if eval_features else "no",
 		"bf16": plan.precision == "bf16",
 		"fp16": plan.precision == "fp16",
@@ -352,7 +363,10 @@ def run_training(run_dir, status):
 	except ImportError:
 		pass
 	status.update(stage="Training", progress={"step": 0, "total": total_steps, "eta": None})
-	trainer.train()
+	resume = any((run_dir / "checkpoints").glob("checkpoint-*"))
+	if resume:
+		log("Resuming from the last checkpoint")
+	trainer.train(resume_from_checkpoint=True if resume else None)
 	train_seconds = time.time() - started
 
 	status.update(stage="Saving adapter")
@@ -368,10 +382,9 @@ def run_training(run_dir, status):
 		from unsloth import FastLanguageModel
 		FastLanguageModel.for_inference(model)
 	model.eval()
-	rows, eval_on = eval_rows[:MAX_EVAL_EXAMPLES], "held-out examples"
+	rows, eval_on = eval_rows, "held-out examples"
 	if not rows:
-		rows, eval_on = train_rows[:20], "training examples (add 10+ examples for a held-out test)"
-	answer_tokens = max(len(tokenizer(format_output(r["output"]), add_special_tokens=False)["input_ids"]) for r in train_rows + eval_rows)
+		rows, eval_on = [train_rows[i] for i in range(min(20, len(train_rows)))], "training examples (add 10+ examples for a held-out test)"
 	max_new = min(4096, int(answer_tokens * 1.5) + 32)
 	log(f"Evaluating on {len(rows)} {eval_on}")
 	texts = answer(model, processor, spec, rows, run_dir / "images", max_new, max(1, batch_size), torch)

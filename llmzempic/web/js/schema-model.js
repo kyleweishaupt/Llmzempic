@@ -1,6 +1,7 @@
 // JSON Schema <-> editable field tree. Pure: no DOM.
 //
-// Node: { id, kind, name?, required?, description, nullable, options?, minimum?, maximum?, item?, fields?, extra }
+// Node: { id, kind, name?, required?, description, nullable, options?, minimum?, maximum?, minItems?, maxItems?,
+//         dataset?, item?, fields?, extra }
 // `extra` carries keys the editor doesn't model (title, format, additionalProperties, ...) so a
 // round trip through the visual editor never drops them.
 
@@ -11,11 +12,14 @@ export const KINDS = [
 	["boolean", "Yes / no", "toggle"],
 	["choice", "One of a list", "radio"],
 	["tags", "Several of a list", "tag"],
+	["dataset", "Value from a data set", "database"],
 	["list", "List", "list"],
 	["object", "Group of fields", "braces"],
 ];
 
-export const ITEM_KINDS = [["text", "Text"], ["number", "Number"], ["integer", "Whole number"], ["boolean", "Yes / no"], ["object", "Group of fields"], ["any", "Anything"]];
+export const ITEM_KINDS = [["text", "Text"], ["number", "Number"], ["integer", "Whole number"], ["boolean", "Yes / no"], ["dataset", "Value from a data set"], ["object", "Group of fields"], ["any", "Anything"]];
+
+export const DATASET_KEY = "x-dataset";
 
 const BLOCKED = ["anyOf", "oneOf", "allOf", "not", "$ref", "$defs", "definitions", "if", "then", "else", "patternProperties",
 	"prefixItems", "const", "dependentSchemas", "dependentRequired", "propertyNames", "unevaluatedProperties", "contains"];
@@ -26,8 +30,9 @@ const MODELED = {
 	number: ["type", "description", "minimum", "maximum"],
 	integer: ["type", "description", "minimum", "maximum"],
 	choice: ["type", "description", "enum"],
-	tags: ["type", "description", "items"],
-	list: ["type", "description", "items"],
+	tags: ["type", "description", "items", "minItems", "maxItems"],
+	list: ["type", "description", "items", "minItems", "maxItems"],
+	dataset: ["type", "description", "x-dataset"],
 	object: ["type", "description", "properties", "required"],
 };
 
@@ -63,12 +68,14 @@ function parseNode(schema, path) {
 		Object.assign(node, { kind: "choice", options, nullable: node.nullable || schema.enum.includes(null) });
 	} else {
 		if (!type && isObj(schema.properties)) type = "object";
-		if (type === "string") node.kind = "text";
+		if (type === "string" && typeof schema[DATASET_KEY] === "string") Object.assign(node, { kind: "dataset", dataset: schema[DATASET_KEY] });
+		else if (type === "string") node.kind = "text";
 		else if (type === "boolean") node.kind = "boolean";
 		else if (type === "number" || type === "integer") {
 			Object.assign(node, { kind: type, minimum: isNum(schema.minimum) ? schema.minimum : null, maximum: isNum(schema.maximum) ? schema.maximum : null });
 		} else if (type === "array") {
 			const items = schema.items;
+			Object.assign(node, { minItems: isNum(schema.minItems) ? schema.minItems : null, maxItems: isNum(schema.maxItems) ? schema.maxItems : null });
 			if (isObj(items) && Array.isArray(items.enum) && items.enum.every((v) => typeof v === "string") && (!items.type || items.type === "string")) {
 				const itemExtra = { ...items };
 				delete itemExtra.type;
@@ -104,6 +111,11 @@ export function fromSchema(schema) {
 	}
 }
 
+function counts(node, out) {
+	if (isNum(node.minItems)) out.minItems = node.minItems;
+	if (isNum(node.maxItems)) out.maxItems = node.maxItems;
+}
+
 function emit(node) {
 	const t = (base) => (node.nullable ? [base, "null"] : base);
 	const out = {};
@@ -120,13 +132,19 @@ function emit(node) {
 			out.type = t("string");
 			out.enum = node.nullable ? [...node.options, null] : [...node.options];
 			break;
+		case "dataset":
+			out.type = t("string");
+			out[DATASET_KEY] = node.dataset;
+			break;
 		case "tags":
 			out.type = t("array");
 			out.items = { type: "string", enum: [...node.options], ...(node.itemExtra || {}) };
+			counts(node, out);
 			break;
 		case "list":
 			out.type = t("array");
 			if (node.item) out.items = emit(node.item);
+			counts(node, out);
 			break;
 		case "object": {
 			out.type = t("object");
@@ -150,7 +168,9 @@ export function newNode(kind, name = "") {
 	const node = { id: uid(), kind, name, required: true, description: "", nullable: false, extra: {} };
 	if (kind === "choice" || kind === "tags") node.options = [];
 	if (kind === "number" || kind === "integer") Object.assign(node, { minimum: null, maximum: null });
+	if (kind === "list" || kind === "tags") Object.assign(node, { minItems: null, maxItems: null });
 	if (kind === "list") node.item = newNode("text");
+	if (kind === "dataset") node.dataset = "";
 	if (kind === "object") Object.assign(node, { fields: [], extra: { additionalProperties: false } });
 	return node;
 }
@@ -181,22 +201,29 @@ export function problems(root) {
 			}
 		}
 		if ((node.kind === "choice" || node.kind === "tags") && !node.options.length) out.errors.set(node.id, "Add at least one option.");
-		if (node.kind === "list" && node.item) visit(node.item);
+		if (node.kind === "dataset" && !node.dataset) out.errors.set(node.id, "Choose a data set.");
+		if (isNum(node.minItems) && isNum(node.maxItems) && node.minItems > node.maxItems) out.errors.set(node.id, "The minimum can't be more than the maximum.");
+		if (node.kind === "list" && node.item) {
+			visit(node.item);
+			if (out.errors.has(node.item.id)) out.errors.set(node.id, out.errors.get(node.item.id));
+		}
 	};
 	visit(root);
 	return out;
 }
 
-export function sample(node) {
+// names: data set id -> display name, for the placeholder of data set fields.
+export function sample(node, names = {}) {
 	switch (node.kind) {
 		case "text": return node.description ? `<${node.description.slice(0, 40)}>` : "text";
 		case "number": return isNum(node.minimum) ? node.minimum : 0.5;
 		case "integer": return isNum(node.minimum) ? node.minimum : 1;
 		case "boolean": return true;
 		case "choice": return node.options[0] ?? "";
+		case "dataset": return `<value from ${names[node.dataset] || node.dataset || "a data set"}>`;
 		case "tags": return node.options.slice(0, 2);
-		case "list": return node.item ? [sample(node.item)] : [];
-		case "object": return Object.fromEntries(node.fields.map((f) => [f.name, sample(f)]));
+		case "list": return node.item ? [sample(node.item, names)] : [];
+		case "object": return Object.fromEntries(node.fields.map((f) => [f.name, sample(f, names)]));
 		default: return null;
 	}
 }

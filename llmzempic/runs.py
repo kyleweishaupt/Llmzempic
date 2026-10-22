@@ -5,11 +5,12 @@ import re
 import time
 
 from . import __version__
-from .dataset import split_examples
+from .dataset import split_examples, split_keys
 from .fileio import read_json, write_json, write_jsonl
 from .images import image_path, link_images
 from .prompts import build_system_prompt
-from .schema_tools import check_schema, validate_output
+from .refs import referenced_ids
+from .schema_tools import check_schema
 from .workspace import catalog_entry, slugify
 
 GGUF_TYPES = ["q8_0", "f16", "bf16", "q4_k_m", "q5_k_m", "none"]
@@ -19,40 +20,21 @@ class RunError(Exception):
 	pass
 
 
-def _input_errors(example, input_kind, images_dir):
-	if input_kind != "image":
-		return [] if str(example.get("input", "")).strip() else ["Input is empty"]
-	if not example.get("image"):
-		return ["No image"]
-	try:
-		image_path(images_dir, example["image"])
-	except KeyError:
-		return ["Image file is missing"]
-	return []
-
-
-def validate_examples(examples, schema, input_kind="text", images_dir=None):
-	invalid = []
-	if check_schema(schema):
-		return invalid
-	for example in examples:
-		errors = _input_errors(example, input_kind, images_dir) + validate_output(example.get("output"), schema)
-		if errors:
-			invalid.append({"id": example.get("id"), "errors": errors})
-	return invalid
-
-
 def model_name(spec):
 	"""Name used for the exported model (Ollama tag, file names)."""
 	return slugify(spec.get("project_name") or spec.get("project_id") or "model")
 
 
-def create_run(project):
+def create_run(project, library, checker):
+	"""Snapshot a project into a run folder: spec, streamed train/eval files, images and data sets."""
 	config = project.load_config()
 	schema = config["schema"]
 	problems = check_schema(schema)
 	if problems:
 		raise RunError(problems[0])
+	missing_sets = sorted(i for i in referenced_ids(schema) if i not in {m["id"] for m in library.list()})
+	if missing_sets:
+		raise RunError(f'Data set "{missing_sets[0]}" no longer exists. Choose another on the Task tab.')
 	if not str(config.get("base_model") or "").strip():
 		raise RunError("Choose a base model first.")
 	input_kind = config.get("input_kind", "text")
@@ -61,17 +43,49 @@ def create_run(project):
 		raise RunError(f"{entry['name']} can't read images. Pick a vision model on the Model tab.")
 	if entry and input_kind != "image" and entry.get("vision"):
 		raise RunError(f"{entry['name']} is a vision model. Pick a text model on the Model tab.")
-	examples = project.load_examples()
-	if len(examples) < 2:
+	store = project.examples()
+	if store.count() < 2:
 		raise RunError("Add at least 2 examples (20 or more is recommended).")
-	invalid = validate_examples(examples, schema, input_kind, project.images_dir)
-	if invalid:
-		raise RunError(f"{len(invalid)} example(s) have problems. Fix them on the Examples tab.")
+	checker.ensure(project, library)
+	progress = checker.progress(project.id)
+	if progress.get("error"):
+		raise RunError(f"Checking examples failed: {progress['error']}. Details are in the server log.")
+	if progress["running"] or progress["done"] < progress["total"]:
+		raise RunError(f"Still checking examples ({progress['done']} of {progress['total']}). Start training when it finishes.")
+	bad = store.problem_count()
+	if bad:
+		raise RunError(f"{bad} example(s) have problems. Fix them on the Examples tab.")
 
 	training = config["training"]
-	train_rows, eval_rows, split = split_examples(
-		examples, schema, float(training.get("eval_fraction") or 0), int(training.get("seed") or 42)
+	train_ids, eval_ids, split = split_examples(
+		split_keys(store.iter_rows(), schema), schema,
+		float(training.get("eval_fraction") or 0), int(training.get("seed") or 42),
+		held_out_max=min(2000, max(1, int(training.get("eval_max") or 300))), max_examples=max(0, int(training.get("max_examples") or 0)),
 	)
+	run_dir = project.new_run_dir()
+	datasets = {}
+	for dataset_id in sorted(referenced_ids(schema)):
+		dataset = library.get(dataset_id)
+		dataset.copy_to(run_dir / "datasets" / dataset_id)
+		datasets[dataset_id] = {k: dataset.meta.get(k) for k in ("name", "hash", "rows")}
+
+	# Train rows stream to disk in project order (the trainer shuffles); held-out rows keep the split's order.
+	train_set, eval_order = set(train_ids), {example_id: i for i, example_id in enumerate(eval_ids)}
+	held_out, images = [None] * len(eval_ids), set()
+	with open(run_dir / "train.jsonl", "w", encoding="utf-8") as train_file:
+		for row in store.iter_rows():
+			row.pop("errors", None)
+			if row["id"] in train_set:
+				train_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+			elif row["id"] in eval_order:
+				held_out[eval_order[row["id"]]] = row
+			else:
+				continue
+			if row.get("image"):
+				images.add(row["image"])
+	write_jsonl(run_dir / "eval.jsonl", held_out)
+	if input_kind == "image":
+		link_images(images, project.images_dir, run_dir / "images")
 
 	spec = {
 		"project_id": project.id,
@@ -81,22 +95,19 @@ def create_run(project):
 		"input_kind": input_kind,
 		"instructions": config.get("instructions", ""),
 		"schema": schema,
+		"datasets": datasets,
 		"system_prompt": build_system_prompt(
-			config.get("instructions", ""), schema, config.get("include_schema_in_prompt", True)
+			config.get("instructions", ""), schema, config.get("include_schema_in_prompt", True),
+			{dataset_id: d["name"] for dataset_id, d in datasets.items()},
 		),
 		"training": training,
-		"train_count": len(train_rows),
-		"eval_count": len(eval_rows),
+		"train_count": len(train_ids),
+		"eval_count": len(eval_ids),
 		"split": split,
 		"created": time.time(),
 		"app_version": __version__,
 	}
-	run_dir = project.new_run_dir()
-	if input_kind == "image":
-		link_images([e["image"] for e in examples], project.images_dir, run_dir / "images")
 	write_json(run_dir / "run.json", spec)
-	write_jsonl(run_dir / "train.jsonl", train_rows)
-	write_jsonl(run_dir / "eval.jsonl", eval_rows)
 	write_json(run_dir / "status.json", {"state": "queued", "stage": "Waiting to start", "updated": time.time()})
 	return run_dir
 
@@ -177,14 +188,20 @@ def run_summary(run_dir):
 	spec = read_json(run_dir / "run.json", {}) or {}
 	status = read_json(run_dir / "status.json", {}) or {}
 	export_status = read_json(run_dir / "export" / "status.json", None)
+	skipped = read_json(run_dir / "skipped.json", None)
+	checkpoints = run_dir / "checkpoints"
+	resumable = status.get("state") in ("failed", "stopped") and checkpoints.is_dir() and any(checkpoints.glob("checkpoint-*"))
 	return {
 		"id": run_dir.name,
+		"resumable": resumable,
+		"skipped": len(skipped["ids"]) if skipped else None,
 		"created": spec.get("created"),
 		"base_model": spec.get("base_model"),
 		"train_count": spec.get("train_count"),
 		"eval_count": spec.get("eval_count"),
 		"split": spec.get("split"),
 		"input_kind": spec.get("input_kind", "text"),
+		"datasets": spec.get("datasets") or {},
 		"model_name": model_name(spec),
 		"status": status,
 		"metrics": _summary_metrics(read_json(run_dir / "eval.json", None)),

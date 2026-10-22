@@ -1,8 +1,10 @@
 import { runImageUrl } from "./api.js";
 import { h, icon, mount, pill, toggleSwitch } from "./dom.js";
+import { toastError } from "./feedback.js";
 import { clip, labelText, pct } from "./format.js";
 import { jsonNodes } from "./json-view.js";
-import { S } from "./state.js";
+import { loadPage } from "./project.js";
+import { S, app } from "./state.js";
 
 function tone(rate) {
 	if (rate === null || rate === undefined) return "";
@@ -57,6 +59,57 @@ function labelBreakdown(fields) {
 	));
 }
 
+async function showExamples(field, value) {
+	S.query = { filter: "all", search: "", label: { field, value, kind: "ref" }, offset: 0 };
+	S.selection.clear();
+	S.selectAll = false;
+	try {
+		await loadPage({ stats: false });
+	} catch (e) {
+		toastError(e);
+		return;
+	}
+	app.showTab("examples");
+}
+
+const REF_TILES = [
+	["exact", "Exact", "Every value right, in order"],
+	["first", "First value", "The first value right"],
+	["f1", "F1", "Balance of precision and recall"],
+	["precision", "Precision", "Values the model gave that were expected"],
+	["recall", "Recall", "Expected values the model gave"],
+];
+
+function refBreakdown(refs) {
+	return (refs || []).map((r) => h("div", { class: "breakdown stack" },
+		h("h4", {}, h("code", {}, r.field), h("span", { class: "faint" }, ` values from ${r.name}`)),
+		h("div", { class: "metrics ref-metrics" },
+			REF_TILES.map(([key, label, hint]) => h("div", { class: `metric ${tone(r[key])}`, title: hint },
+				h("span", { class: "metric-value num" }, pct(r[key])), h("span", { class: "metric-label" }, label))),
+			h("div", { class: `metric ${r.invalid_rate ? "bad" : "good"}`, title: "Answers with values that aren't in the data set" },
+				h("span", { class: "metric-value num" }, pct(r.invalid_rate)), h("span", { class: "metric-label" }, "Not in the set")),
+		),
+		r.values.length ? h("details", { class: "ref-values" },
+			h("summary", {}, icon("list"), `Per value (${r.values.length} most common)`),
+			h("div", { class: "table-wrap" }, h("table", {},
+				h("thead", {}, h("tr", {},
+					h("th", {}, "Value"),
+					h("th", { class: "num", title: "Scored examples whose expected answer has this value" }, "Examples"),
+					h("th", { title: "How many of those the model answered with this value" }, "Recognized"),
+					h("th", { title: "When the model gave this value, how often it was right" }, "Precision"),
+					h("th", {}, h("span", { class: "sr-only" }, "Examples")),
+				)),
+				h("tbody", {}, r.values.map((v) => h("tr", {},
+					h("td", {}, h("code", {}, v.value)),
+					h("td", { class: "num" }, String(v.expected)),
+					rateBar(v.correct, v.expected),
+					rateBar(v.correct, v.predicted),
+					h("td", {}, h("button", { type: "button", class: "link-btn small nowrap", onclick: () => showExamples(r.field, v.value) }, "Show examples")),
+				))),
+			))) : null,
+	));
+}
+
 const inlineJson = (v) => h("code", { class: "json-inline" }, jsonNodes(v));
 
 function predictionRow(it) {
@@ -86,6 +139,7 @@ export function evaluationView(ev) {
 		fields.length > 1 ? h("div", { class: "field-acc" }, h("span", { class: "muted small" }, "Per field"),
 			fields.map(([k, v]) => h("span", { class: `chip ${tone(v)}-chip-lite` }, h("code", {}, k), h("span", { class: "count" }, pct(v))))) : null,
 		labelBreakdown(ev.labels),
+		refBreakdown(ev.refs),
 		h("details", { class: "card predictions", open: wrong > 0 && wrong <= 20 },
 			h("summary", {}, icon("list"), h("span", { class: "grow" }, `Predictions (${ev.items.length})`), wrong ? pill(`${wrong} not exact`, "warn") : pill("All exact", "good")),
 			h("div", { class: "stack pred-body" },

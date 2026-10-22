@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,6 +41,20 @@ def env(tmp_path):
 	return client, ws, jobs
 
 
+def checked(client, pid, query=""):
+	"""GET the examples once background checks have caught up."""
+	for _ in range(200):
+		data = client.get(f"/api/projects/{pid}/examples{query}").json()
+		if not data["checking"]["running"]:
+			return data
+		time.sleep(0.05)
+	raise AssertionError("checks never finished")
+
+
+def problems(client, pid):
+	return sorted(e["errors"][0] for e in checked(client, pid, "?filter=problems&limit=100")["examples"])
+
+
 def make_project(client):
 	res = client.post("/api/projects", json={"name": "Ticket Router", "template": "classification"})
 	assert res.status_code == 200
@@ -77,17 +92,19 @@ def test_project_flow_to_training_and_export(env):
 
 	examples = [{"input": f"text {i}", "output": {"label": "billing" if i % 2 else "technical"}} for i in range(12)]
 	examples.append({"input": "bad", "output": {"label": "nope"}})
-	data = client.put(f"/api/projects/{pid}/examples", json={"examples": examples}).json()
-	assert len(data["invalid"]) == 1
+	client.put(f"/api/projects/{pid}/examples", json={"examples": examples})
+	data = checked(client, pid)
+	assert data["counts"]["problems"] == 1
 	label_counts = {v["value"]: v["count"] for v in data["stats"]["fields"][0]["values"]}
 	assert label_counts == {"billing": 6, "technical": 6, "account": 0, "other": 0}
-	assert data["stats"]["duplicates"] == []
+	assert data["stats"]["duplicates"] == {"groups": 0, "conflicts": 0}
 
 	res = client.post(f"/api/projects/{pid}/runs")
 	assert res.status_code == 400
 	assert "have problems" in res.json()["detail"]
 
 	client.put(f"/api/projects/{pid}/examples", json={"examples": examples[:-1]})
+	checked(client, pid)
 	res = client.post(f"/api/projects/{pid}/runs")
 	assert res.status_code == 200, res.text
 	run_id = res.json()["id"]
@@ -152,14 +169,14 @@ def test_import_and_infer_schema(env):
 	client, _, _ = env
 	pid = make_project(client)
 	csv_text = "input,label\nhello,greeting\nbye,farewell\nhi,greeting\nciao,farewell\n"
-	data = client.post(f"/api/projects/{pid}/import", json={"text": csv_text, "filename": "x.csv", "mode": "replace"}).json()
-	assert data["imported"] == 4
-	assert len(data["invalid"]) == 4  # labels don't match the template's enum yet
+	data = client.post(f"/api/projects/{pid}/import?filename=x.csv&mode=replace", content=csv_text.encode()).json()
+	assert data["added"] == 4
+	assert checked(client, pid)["counts"]["problems"] == 4  # labels don't match the template's enum yet
 	schema = client.post(f"/api/projects/{pid}/infer-schema").json()["schema"]
 	assert schema["properties"]["label"]["enum"] == ["greeting", "farewell"]
 	client.put(f"/api/projects/{pid}", json={"config": {"schema": schema}})
-	data = client.get(f"/api/projects/{pid}/examples").json()
-	assert data["invalid"] == []
+	data = checked(client, pid)
+	assert data["counts"]["problems"] == 0
 	assert data["stats"]["fields"][0]["values"] == [{"value": "greeting", "count": 2}, {"value": "farewell", "count": 2}]
 
 
@@ -203,13 +220,14 @@ def test_image_project_flow(env):
 	examples = [{"input": "", "image": n, "output": {"hot_dog": i % 2 == 0}} for i, n in enumerate(names)]
 	missing = [{"input": "no picture", "output": {"hot_dog": True}}, {"input": "", "image": "0" * 24 + ".png", "output": {"hot_dog": True}}]
 	data = client.put(f"/api/projects/{pid}/examples", json={"examples": examples + missing}).json()
-	assert sorted(i["errors"][0] for i in data["invalid"]) == ["Image file is missing", "No image"]
+	assert problems(client, pid) == ["Image file is missing", "No image"]
 	assert data["examples"][0]["image"] == names[0]
 
 	# The UI's JSONL download carries image names; importing it back keeps them.
 	jsonl = "\n".join(json.dumps({"input": "", "image": n, "output": {"hot_dog": True}}) for n in names[:2])
-	data = client.post(f"/api/projects/{pid}/import", json={"text": jsonl, "filename": "x.jsonl", "mode": "replace"}).json()
-	assert [e["image"] for e in data["examples"]] == names[:2] and data["invalid"] == []
+	client.post(f"/api/projects/{pid}/import?filename=x.jsonl&mode=replace", content=jsonl.encode())
+	data = checked(client, pid)
+	assert [e["image"] for e in data["examples"]] == names[:2] and data["counts"]["problems"] == 0
 
 	client.put(f"/api/projects/{pid}/examples", json={"examples": examples})
 	client.put(f"/api/projects/{pid}", json={"config": {"base_model": "Qwen/Qwen2.5-1.5B-Instruct"}})
@@ -217,6 +235,7 @@ def test_image_project_flow(env):
 	assert res.status_code == 400 and "can't read images" in res.json()["detail"]
 
 	client.put(f"/api/projects/{pid}", json={"config": {"base_model": "someone/custom-vlm"}})
+	checked(client, pid)
 	res = client.post(f"/api/projects/{pid}/runs")
 	assert res.status_code == 200, res.text
 	run_id = res.json()["id"]

@@ -1,18 +1,19 @@
-import { api } from "./api.js";
-import { $, $$, button, emptyState, h, icon, menu, mount } from "./dom.js";
-import { deleteExamples, filterCounts, visibleExamples } from "./example-ops.js";
-import { saver, toast, toastError } from "./feedback.js";
-import { bytes, labelText, plural, randomId } from "./format.js";
-import { gallery, selectAllToggle, selectionBar } from "./gallery.js";
+import { uploadFile } from "./api.js";
+import { $, $$, button, callout, emptyState, h, icon, menu, mount } from "./dom.js";
+import { addExamples, deleteExamples, reloadExamples } from "./example-ops.js";
+import { progressDialog, saver, toast, toastError } from "./feedback.js";
+import { bytes, labelText, plural } from "./format.js";
+import { gallery, selectAllToggle, selectionBar, toggleSelect } from "./gallery.js";
 import { healthPanel } from "./health.js";
 import { openIntake, pickImages } from "./intake.js";
 import { outputForm } from "./output-form.js";
-import { scheduleExamplesSave } from "./project.js";
+import { loadPage, pageSize, saveExample } from "./project.js";
 import { blankOutput } from "./schema-model.js";
-import { S, app, exampleErrors, isImageProject, schemaTree, setExamplesData } from "./state.js";
+import { S, app, exampleErrors, isImageProject, schemaTree } from "./state.js";
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
-const pageSize = () => (isImageProject() ? 48 : 20);
+const CHARS_PER_TOKEN = 3.5;
+const IMPORT_MODES = { append: "Add to these", update: "Update matching ids, add the rest", replace: "Replace all" };
 
 function autoGrow(textarea) {
 	const fit = () => {
@@ -33,7 +34,7 @@ function readTextFile(ex) {
 		if (!file) return;
 		if (file.size > 512 * 1024) toast(`${file.name} is ${bytes(file.size)}. Long inputs need a lot of memory to train on.`, true);
 		ex.input = await file.text();
-		scheduleExamplesSave();
+		saveExample(ex);
 		renderList();
 	});
 	input.click();
@@ -45,38 +46,48 @@ function jsonAnswer(ex) {
 		try {
 			ex.output = JSON.parse(area.value);
 			S.badJson.delete(ex.id);
+			saveExample(ex);
 		} catch (err) {
 			S.badJson.set(ex.id, `The answer isn't valid JSON: ${err.message}`);
 		}
 		updateErrors();
-		scheduleExamplesSave();
 	});
 	return autoGrow(area);
 }
 
-function exampleRow(ex) {
+const tokens = (text) => Math.ceil(text.length / CHARS_PER_TOKEN);
+
+function exampleRow(ex, index) {
 	const parsed = schemaTree();
 	const formOk = parsed.ok && isObj(ex.output);
 	const asJson = !formOk || S.jsonEditing.has(ex.id);
+	const count = h("span", { class: "faint small num", title: "Rough token count" }, `≈${tokens(ex.input).toLocaleString()} tokens`);
 	const input = autoGrow(h("textarea", { rows: 2, value: ex.input, placeholder: "The input text…", "data-focus": `${ex.id}:input`, "aria-label": "Input" }));
-	input.addEventListener("input", () => { ex.input = input.value; scheduleExamplesSave(); });
+	input.addEventListener("input", () => {
+		ex.input = input.value;
+		count.textContent = `≈${tokens(ex.input).toLocaleString()} tokens`;
+		saveExample(ex);
+	});
 	const flip = () => {
 		if (asJson) S.jsonEditing.delete(ex.id);
 		else S.jsonEditing.add(ex.id);
 		renderList();
 	};
-	return h("article", { class: "example-row card", dataset: { id: ex.id } },
+	const n = S.query.offset + index + 1;
+	const pick = h("input", { type: "checkbox", checked: S.selection.has(ex.id), title: "Select (Shift-click for a range)", "aria-label": `Select example ${n}` });
+	pick.addEventListener("click", (e) => toggleSelect(ex, S.examples, e.shiftKey));
+	return h("article", { class: `example-row card${S.selection.has(ex.id) ? " selected" : ""}`, dataset: { id: ex.id } },
 		h("div", { class: "ex-col" },
-			h("div", { class: "ex-label" }, h("span", {}, "Input"), h("span", { class: "faint num" }, `#${S.examples.indexOf(ex) + 1}`), h("span", { class: "grow" }),
+			h("div", { class: "ex-label" }, pick, h("span", {}, "Input"), h("span", { class: "faint num" }, `#${n.toLocaleString()}`), count, h("span", { class: "grow" }),
 				button("From file", { icon: "upload", kind: "ghost", size: "sm", title: "Replace the input with a text file's contents", onclick: () => readTextFile(ex) })),
 			input,
 		),
 		h("div", { class: "ex-col" },
 			h("div", { class: "ex-label" }, h("span", {}, "Answer"), h("span", { class: "grow" }),
 				formOk ? button(asJson ? "Form" : "JSON", { icon: asJson ? "list" : "braces", kind: "ghost", size: "sm", title: asJson ? "Edit with the form" : "Edit the raw JSON", onclick: flip }) : null),
-			asJson ? jsonAnswer(ex) : outputForm(parsed.root, ex.output, () => scheduleExamplesSave(), { keyPrefix: ex.id }),
+			asJson ? jsonAnswer(ex) : outputForm(parsed.root, ex.output, () => saveExample(ex), { keyPrefix: ex.id }),
 		),
-		button(null, { icon: "trash", kind: "ghost", size: "sm", title: "Delete example", cls: "ex-delete", onclick: () => deleteExamples([ex.id]) }),
+		button(null, { icon: "trash", kind: "ghost", size: "sm", title: "Delete example", cls: "ex-delete", onclick: () => deleteExamples({ ids: [ex.id] }) }),
 		h("div", { class: "ex-errors" }),
 	);
 }
@@ -96,15 +107,18 @@ function updateErrors() {
 	}
 }
 
-// ---------- adding & importing ----------
+// ---------- adding, importing, exporting ----------
 
-function addTextExample() {
-	S.examples.unshift({ id: randomId(), input: "", output: blankOutput(S.config.schema) });
-	Object.assign(S, { page: 0, filter: "all", labelFilter: null, search: "" });
-	scheduleExamplesSave();
-	renderExamples();
-	const first = $("#tab-examples .example-row textarea");
-	if (first) first.focus();
+async function addTextExample() {
+	try {
+		await addExamples([{ input: "", output: blankOutput(S.config.schema) }]);
+		S.query = { filter: "all", search: "", label: null, offset: 0 };
+		await reloadExamples();
+		const first = $("#tab-examples .example-row textarea");
+		if (first) first.focus();
+	} catch (e) {
+		toastError(e);
+	}
 }
 
 function importFile(mode) {
@@ -112,27 +126,28 @@ function importFile(mode) {
 	input.addEventListener("change", async () => {
 		const file = input.files[0];
 		if (!file) return;
+		await saver.flush();
+		const busy = progressDialog(`Importing ${file.name}`, `Uploading ${bytes(file.size)}…`);
 		try {
-			await saver.flush();
-			const data = await api(`/projects/${S.pid}/import`, { method: "POST", body: { text: await file.text(), filename: file.name, mode } });
-			setExamplesData(data);
-			S.page = 0;
-			S.importWarnings = data.warnings;
-			renderExamples();
-			app.renderStepper();
-			toast(`Imported ${plural(data.imported, "example")}` + (data.warnings.length ? `; skipped ${data.warnings.length}` : ""));
+			const res = await uploadFile(`/projects/${S.pid}/import?${new URLSearchParams({ filename: file.name, mode })}`, file, (share) => {
+				busy.progress(share);
+				if (share >= 1) busy.text("Reading the examples…");
+			});
+			S.importWarnings = res.warning_count ? { count: res.warning_count, lines: res.warnings } : null;
+			S.query = { filter: "all", search: "", label: null, offset: 0 };
+			await reloadExamples();
+			toast(`Imported ${plural(res.added, "new example")}` + (res.updated ? `, updated ${res.updated.toLocaleString()}` : "") + (res.warning_count ? `; skipped ${res.warning_count.toLocaleString()}` : ""));
 		} catch (e) {
 			toastError(e);
+		} finally {
+			busy.close();
 		}
 	});
 	input.click();
 }
 
 function downloadJsonl() {
-	const text = S.examples.map((e) => JSON.stringify(e.image ? { input: e.input, image: e.image, output: e.output } : { input: e.input, output: e.output })).join("\n") + "\n";
-	const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "application/jsonl" })), download: `${S.pid}-examples.jsonl` });
-	a.click();
-	setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+	h("a", { href: `/api/projects/${encodeURIComponent(S.pid)}/examples/export`, download: `${S.pid}-examples.jsonl` }).click();
 }
 
 // ---------- layout ----------
@@ -146,10 +161,9 @@ function header() {
 		),
 		h("div", { class: "row" },
 			menu(button("Import / export", { icon: "folder", kind: "secondary" }), [
-				{ label: "Import a file (add to these)", icon: "upload", onclick: () => importFile("append") },
-				{ label: "Import a file (replace all)", icon: "upload", onclick: () => importFile("replace") },
+				...Object.entries(IMPORT_MODES).map(([mode, text]) => ({ label: `Import a file: ${text.toLowerCase()}`, icon: "upload", onclick: () => importFile(mode) })),
 				"-",
-				{ label: "Download as JSONL", icon: "download", disabled: !S.examples.length, onclick: downloadJsonl },
+				{ label: "Download as JSONL", icon: "download", disabled: !S.counts.all, onclick: downloadJsonl },
 			]),
 			image
 				? button("Add images", { icon: "image", kind: "primary", onclick: () => pickImages(openIntake) })
@@ -158,94 +172,103 @@ function header() {
 	);
 }
 
-function setFilter(changes) {
-	Object.assign(S, { page: 0 }, changes);
-	renderExamples();
+async function setQuery(changes) {
+	Object.assign(S.query, { offset: 0 }, changes);
+	S.selection.clear();
+	S.selectAll = false;
+	try {
+		await loadPage({ stats: false });
+	} catch (e) {
+		toastError(e);
+	}
+	renderList();
 }
 
-function filterBar(page) {
-	const counts = filterCounts();
-	const chip = (key, text, n) => h("button", { type: "button", class: "chip", "aria-pressed": String(S.filter === key), onclick: () => setFilter({ filter: key }) },
+function filterBar() {
+	const q = S.query;
+	const chip = (key, text, n) => h("button", { type: "button", class: "chip", "aria-pressed": String(q.filter === key), onclick: () => setQuery({ filter: key }) },
 		text, h("span", { class: "count" }, n.toLocaleString()));
-	const search = h("input", { type: "search", value: S.search, placeholder: "Search inputs and answers", "data-focus": "ex-search", "aria-label": "Search examples" });
+	const search = h("input", { type: "search", value: q.search, placeholder: "Search inputs and answers", "data-focus": "ex-search", "aria-label": "Search examples" });
 	let timer;
 	search.addEventListener("input", () => {
 		clearTimeout(timer);
-		timer = setTimeout(() => { S.search = search.value; S.page = 0; renderList(); }, 200);
+		timer = setTimeout(() => setQuery({ search: search.value }), 250);
 	});
 	return h("div", { class: "filter-bar" },
 		h("div", { class: "search-box" }, icon("search"), search),
 		h("div", { class: "row" },
-			chip("all", "All", counts.all),
-			counts.problems || S.filter === "problems" ? chip("problems", "To fix", counts.problems) : null,
-			counts.duplicates || S.filter === "duplicates" ? chip("duplicates", "Repeated", counts.duplicates) : null,
-			S.labelFilter ? h("span", { class: "chip", "aria-pressed": "true" }, icon("filter"), `${S.labelFilter.field}: ${labelText(S.labelFilter.value)}`,
-				h("button", { type: "button", class: "x", "aria-label": "Clear label filter", onclick: () => setFilter({ labelFilter: null }) }, icon("x"))) : null,
+			chip("all", "All", S.counts.all),
+			S.counts.problems || q.filter === "problems" ? chip("problems", "To fix", S.counts.problems) : null,
+			S.counts.duplicates || q.filter === "duplicates" ? chip("duplicates", "Repeated", S.counts.duplicates) : null,
+			q.label ? h("span", { class: "chip", "aria-pressed": "true" }, icon("filter"), `${q.label.field}: ${labelText(q.label.value)}`,
+				h("button", { type: "button", class: "x", "aria-label": "Clear the value filter", onclick: () => setQuery({ label: null }) }, icon("x"))) : null,
 		),
 		h("span", { class: "grow" }),
-		isImageProject() && page.length ? selectAllToggle(page) : null,
+		S.examples.length ? selectAllToggle(S.examples) : null,
 	);
 }
 
-function pager(total) {
+function pager() {
 	const size = pageSize();
-	const pages = Math.max(1, Math.ceil(total / size));
-	if (pages <= 1) return null;
-	const go = (p) => { S.page = p; renderList(); $("#tab-examples").scrollIntoView({ block: "start" }); };
-	const start = S.page * size;
+	if (S.total <= size) return null;
+	const go = async (offset) => {
+		await saver.flush();
+		S.query.offset = offset;
+		await loadPage({ stats: false });
+		renderList();
+		$("#tab-examples").scrollIntoView({ block: "start" });
+	};
+	const start = S.query.offset;
 	return h("div", { class: "pager" },
-		button(null, { icon: "chevron-left", kind: "secondary", size: "sm", title: "Previous page", disabled: S.page === 0, onclick: () => go(S.page - 1) }),
-		h("span", { class: "muted num" }, `${start + 1}–${Math.min(total, start + size)} of ${total.toLocaleString()}`),
-		button(null, { icon: "chevron-right", kind: "secondary", size: "sm", title: "Next page", disabled: S.page >= pages - 1, onclick: () => go(S.page + 1) }),
+		button(null, { icon: "chevron-left", kind: "secondary", size: "sm", title: "Previous page", disabled: start === 0, onclick: () => go(Math.max(0, start - size)) }),
+		h("span", { class: "muted num" }, `${(start + 1).toLocaleString()}–${Math.min(S.total, start + size).toLocaleString()} of ${S.total.toLocaleString()}`),
+		button(null, { icon: "chevron-right", kind: "secondary", size: "sm", title: "Next page", disabled: start + size >= S.total, onclick: () => go(start + size) }),
 	);
 }
 
 function emptyView() {
-	if (S.examples.length) {
+	if (S.counts.all) {
 		return emptyState("search", "Nothing matches", "No examples match the current filter or search.",
-			button("Show all", { kind: "secondary", onclick: () => setFilter({ filter: "all", labelFilter: null, search: "" }) }));
+			button("Show all", { kind: "secondary", onclick: () => setQuery({ filter: "all", label: null, search: "" }) }));
 	}
 	if (isImageProject()) {
-		const zone = h("button", { type: "button", class: "dropzone big", onclick: () => pickImages(openIntake) },
+		return h("button", { type: "button", class: "dropzone big", onclick: () => pickImages(openIntake) },
 			icon("upload"), h("b", {}, "Drop images here, paste them, or click to choose"),
 			h("span", { class: "muted" }, "Add a batch of pictures that need the same answer, then the next batch. Aim for at least 20 per label."));
-		return zone;
 	}
-	return emptyState("text", "No examples yet", "Add inputs with the answer you expect, or import a JSONL or CSV file. Aim for at least 20; 100+ covering every label is better.",
+	return emptyState("text", "No examples yet", "Add inputs with the answer you expect, or import a JSONL or CSV file of any size. Aim for at least 20; 100+ covering every label is better.",
 		button("Add example", { icon: "plus", kind: "primary", onclick: addTextExample }),
 		button("Import a file", { icon: "upload", kind: "secondary", onclick: () => importFile("append") }));
 }
 
 function renderList() {
-	const list = visibleExamples();
-	const size = pageSize();
-	S.page = Math.min(S.page, Math.max(0, Math.ceil(list.length / size) - 1));
-	const page = list.slice(S.page * size, S.page * size + size);
-	mount($("#ex-filters"), S.examples.length ? filterBar(page) : null);
-	mount($("#ex-list"), !page.length ? emptyView() : isImageProject() ? gallery(page) : h("div", { class: "example-list" }, page.map(exampleRow)));
-	mount($("#ex-pager"), pager(list.length));
-	mount($("#ex-selection"), isImageProject() ? selectionBar() : null);
+	const rows = S.examples;
+	mount($("#ex-filters"), S.counts.all ? filterBar() : null);
+	mount($("#ex-list"), !rows.length ? emptyView() : isImageProject() ? gallery(rows) : h("div", { class: "example-list" }, rows.map(exampleRow)));
+	mount($("#ex-pager"), pager());
+	mount($("#ex-selection"), selectionBar());
 	updateErrors();
 }
 
 function renderHealth() {
-	mount($("#ex-health"), S.examples.length ? healthPanel({
-		onFilter: (labelFilter) => setFilter({ labelFilter }),
-		onShow: (filter) => setFilter({ filter }),
+	mount($("#ex-health"), S.counts.all ? healthPanel({
+		onFilter: (label) => setQuery({ label }),
+		onShow: (filter) => setQuery({ filter }),
 	}) : null);
 }
 
+
 export function renderExamples({ keepScroll = false } = {}) {
 	const y = window.scrollY;
-	const pane = $("#tab-examples");
-	const warnings = S.importWarnings || [];
-	mount(pane,
+	const warnings = S.importWarnings;
+	mount($("#tab-examples"),
 		h("div", { class: "stack-lg" },
 			header(),
-			warnings.length ? h("div", { class: "callout warn" }, icon("alert"), h("div", { class: "grow" },
-				h("b", {}, `${plural(warnings.length, "record")} skipped during import`),
-				h("ul", {}, warnings.slice(0, 8).map((w) => h("li", {}, w))),
-				button("Dismiss", { kind: "ghost", size: "sm", onclick: () => { S.importWarnings = []; renderExamples({ keepScroll: true }); } }))) : null,
+			warnings ? callout("warn", "alert",
+				h("b", {}, `${plural(warnings.count, "line")} couldn't be imported`),
+				h("ul", {}, warnings.lines.slice(0, 8).map((w) => h("li", {}, w))),
+				warnings.count > 8 ? h("p", { class: "small" }, `…and ${(warnings.count - 8).toLocaleString()} more.`) : null,
+				button("Dismiss", { kind: "ghost", size: "sm", onclick: () => { S.importWarnings = null; renderExamples({ keepScroll: true }); } })) : null,
 			h("div", { id: "ex-health" }),
 			h("div", { class: "stack" }, h("div", { id: "ex-filters" }), h("div", { id: "ex-list" }), h("div", { id: "ex-pager" })),
 		),
@@ -261,8 +284,7 @@ app.examplesChecked = () => {
 	if (S.tab !== "examples") return;
 	updateErrors();
 	renderHealth();
-	const page = visibleExamples();
 	const bar = $("#ex-filters");
-	if (bar && S.examples.length && !bar.contains(document.activeElement)) mount(bar, filterBar(page.slice(S.page * pageSize(), S.page * pageSize() + pageSize())));
+	if (bar && S.counts.all && !bar.contains(document.activeElement)) mount(bar, filterBar());
 };
-document.addEventListener("examples-changed", () => { app.renderExamples(); app.renderStepper(); });
+document.addEventListener("examples-changed", () => reloadExamples().catch(toastError));

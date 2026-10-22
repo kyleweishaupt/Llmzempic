@@ -171,10 +171,12 @@
 	color: var(--text-2);
 	font-size: 13px;
 	white-space: nowrap;
+	flex-wrap: wrap;
+	max-width: 100%;
 }
 
 .inline-field input { width: 110px; min-height: 32px; }
-.inline-field select { min-height: 32px; }
+.inline-field select { min-height: 32px; min-width: 0; max-width: 100%; }
 
 .options-editor {
 	display: flex;

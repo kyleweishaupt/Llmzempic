@@ -1,3 +1,5 @@
+import json
+
 from llmzempic.data import parse_examples
 from llmzempic.metrics import label_breakdown, parse_generated, score_predictions
 from llmzempic.schema_tools import TEMPLATES, check_schema, coerce_value, infer_schema, validate_output
@@ -152,3 +154,38 @@ def test_label_breakdown_tags_booleans_and_bad_input():
 	assert label_breakdown(items, {"type": "nonsense"}) == []
 	assert label_breakdown([], schema) == []
 
+
+
+def test_schema_is_checked_once_per_distinct_schema(monkeypatch):
+	# The checker validates 200k outputs against one schema; re-checking the schema each time was 90% of it.
+	from jsonschema import Draft202012Validator
+	real = Draft202012Validator.check_schema
+	calls = []
+	monkeypatch.setattr(Draft202012Validator, "check_schema", lambda schema: calls.append(1) or real(schema))
+	schema = {"title": "checked once", "type": "object", "properties": {"x": {"type": "integer"}}}
+	for i in range(20):
+		assert validate_output({"x": i}, dict(schema)) == []
+	assert check_schema(dict(schema)) == []
+	assert len(calls) == 1
+
+
+def test_imported_image_must_name_an_uploaded_image(tmp_path):
+	from llmzempic.data import iter_records
+	path = tmp_path / "rows.jsonl"
+	rows = [{"input": "", "image": "C:/Users/me/private-notes.txt", "output": {"x": 1}}, {"input": "", "image": "0123456789abcdef01234567.png", "output": {"x": 2}}]
+	path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+	results = list(iter_records(path, "rows.jsonl"))
+	assert results[0][1] is None and "image" in results[0][2]
+	assert results[1][1]["image"] == "0123456789abcdef01234567.png"
+
+
+def test_long_csv_cells_and_broken_json_arrays_never_crash_an_import(tmp_path):
+	from llmzempic.data import iter_records
+	long_text = "word " * 40000  # past Python's default 131,072-character CSV field limit
+	csv_path = tmp_path / "rows.csv"
+	csv_path.write_text(f'input,label\n"{long_text}",a\nshort,b\n', encoding="utf-8")
+	assert [len(e["input"]) for _, e, _ in iter_records(csv_path, "rows.csv")] == [len(long_text), 5]
+	json_path = tmp_path / "rows.json"
+	json_path.write_text('[{"input": "a", "output": 1},\n{"input": ', encoding="utf-8")
+	[(_, example, warning)] = list(iter_records(json_path, "rows.json"))
+	assert example is None and warning.startswith("Line 2: not valid JSON")

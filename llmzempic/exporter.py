@@ -6,7 +6,9 @@ export/
 	Modelfile                 `ollama create <name> -f Modelfile`
 	system_prompt.txt         the exact prompt the model was trained with
 	schema.json               output JSON Schema (pass it to Ollama `format` / llama-server `response_format`)
-	grammar.gbnf              GBNF grammar for in-process bindings (only if llama.cpp ships its Python converter)
+	grammar.gbnf              GBNF grammar: data set projects always (llama-server --grammar-file); others
+	                          when llama.cpp ships its Python converter (in-process bindings)
+	datasets/<id>.txt         data set projects: the allowed values, one per line, for the clients' checks
 	llmzempic.json            manifest for programs
 	integration/              PHP, C#, Python clients and a llama-server request
 	merged/                   (optional) merged Hugging Face safetensors model
@@ -23,7 +25,10 @@ import zipfile
 from pathlib import Path
 
 from . import vision
+from .datasets import run_resolver
 from .fileio import read_json, read_jsonl, write_json
+from .grammar import values_grammar
+from .refs import export_contract, referenced_ids
 from .snippets import all_snippets, llama_server_request, pascal, snake
 
 LLAMA_CPP_REPO = "ggml-org/llama.cpp"
@@ -65,7 +70,21 @@ def modelfile_text(spec, gguf_file, ctx, mmproj_file=None):
 	)
 
 
-def readme_text(spec, name, gguf_file, ctx, metrics, mmproj_file=None, image_tokens=None):
+def data_set_notes(refs):
+	fields = list(dict.fromkeys(f"`{r['path'][0]}`" for r in refs))
+	return f"""
+## Data set values
+
+{", ".join(fields)} only answer with values from their data sets. llama-server enforces that with
+`grammar.gbnf`, loaded once at startup with `--grammar-file` (needs a 2024 or later llama-server). Don't
+add a `response_format` to requests, or the server builds a slow grammar for every request. The clients
+in `integration/` call llama-server. Ollama can't enforce lists this long; with it, send `schema.json` as
+`format` for the JSON shape and turn on the clients' value check, which compares every value with
+`datasets/` and raises an error naming any value that isn't on its list. In-process bindings (LLamaSharp, llama-cpp-python) can load `grammar.gbnf` as their grammar.
+"""
+
+
+def readme_text(spec, name, gguf_file, ctx, metrics, mmproj_file=None, image_tokens=None, refs=None):
 	quality = ""
 	if metrics:
 		quality = (
@@ -100,7 +119,7 @@ and schema are already baked into the model's system prompt. Clients: `integrati
 ## Run with llama.cpp's server
 
 ```
-llama-server -m {gguf_file or 'model.gguf'}{server_images} --port 8080 -c {ctx}
+llama-server -m {gguf_file or 'model.gguf'}{server_images}{" --grammar-file grammar.gbnf" if refs else ""} --port 8080 -c {ctx}
 ```
 
 POST `integration/llama-server-request.json` to `http://localhost:8080/v1/chat/completions`.
@@ -112,7 +131,7 @@ Load the GGUF{" with the mmproj image encoder (llama.cpp's mtmd API)" if mmproj_
 system message and the input as the user message using the model's chat template, and constrain sampling to `schema.json` (or `grammar.gbnf`, when
 present) with your binding's grammar / JSON-schema support. For a desktop app, shipping
 llama-server next to it and calling it over localhost is often the simplest reliable option.
-"""
+{data_set_notes(refs) if refs else ""}"""
 
 
 def ensure_llama_cpp(opts):
@@ -221,23 +240,24 @@ def write_grammar(llama_dir, export_dir):
 def write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file=None, image_tokens=None):
 	integration = export_dir / "integration"
 	integration.mkdir(parents=True, exist_ok=True)
-	schema = spec["schema"]
+	schema, refs = export_contract(spec["schema"], spec.get("datasets"))
 	(export_dir / "schema.json").write_text(json.dumps(schema, indent=2, ensure_ascii=False), encoding="utf-8")
 	(export_dir / "system_prompt.txt").write_text(spec["system_prompt"], encoding="utf-8")
 	if gguf_file:
 		(export_dir / "Modelfile").write_text(modelfile_text(spec, gguf_file, ctx, mmproj_file), encoding="utf-8")
 	is_image = vision.is_vision(spec)
-	snippets = all_snippets(name, schema, spec["system_prompt"], gguf_file, ctx, is_image, mmproj_file, image_tokens)
+	snippets = all_snippets(name, schema, spec["system_prompt"], gguf_file, ctx, is_image, mmproj_file, image_tokens, refs)
 	(integration / "client.php").write_text(snippets["php"], encoding="utf-8")
 	(integration / f"{snake(name)}_client.py").write_text(snippets["python"], encoding="utf-8")
 	(integration / f"{pascal(name)}Client.cs").write_text(snippets["csharp"], encoding="utf-8")
 	(integration / "llama-server-request.json").write_text(
 		json.dumps(
-			llama_server_request(spec["system_prompt"], schema, "" if is_image else "Text to analyze", is_image), indent=2, ensure_ascii=False,
+			llama_server_request(spec["system_prompt"], None if refs else schema, "" if is_image else "Text to analyze", is_image),
+			indent=2, ensure_ascii=False,
 		),
 		encoding="utf-8",
 	)
-	(export_dir / "README.md").write_text(readme_text(spec, name, gguf_file, ctx, metrics, mmproj_file, image_tokens), encoding="utf-8")
+	(export_dir / "README.md").write_text(readme_text(spec, name, gguf_file, ctx, metrics, mmproj_file, image_tokens, refs), encoding="utf-8")
 	write_json(export_dir / "llmzempic.json", {
 		"name": name,
 		"project": spec["project_name"],
@@ -249,10 +269,24 @@ def write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_f
 		"context_size": ctx,
 		"system_prompt": spec["system_prompt"],
 		"schema": schema,
+		"datasets": refs,
+		"grammar": "grammar.gbnf" if refs else None,
 		"inference": {"temperature": 0},
 		"metrics": metrics,
 		"exported": time.time(),
 	})
+
+
+def write_value_files(export_dir, spec, resolver):
+	"""Data set projects: each data set's values for the clients' checks, and the grammar llama-server
+	loads so that every data set field answers from its list."""
+	values = lambda dataset_id: (value for value, _ in resolver.datasets[dataset_id].iter_rows())
+	folder = export_dir / "datasets"
+	folder.mkdir(parents=True, exist_ok=True)
+	for dataset_id in sorted(referenced_ids(spec["schema"])):
+		with open(folder / f"{dataset_id}.txt", "w", encoding="utf-8", newline="\n") as f:
+			f.writelines(f"{value}\n" for value in values(dataset_id))
+	(export_dir / "grammar.gbnf").write_text(values_grammar(spec["schema"], values), encoding="utf-8", newline="\n")
 
 
 def run_export(run_dir, status):
@@ -273,6 +307,10 @@ def run_export(run_dir, status):
 	for old in export_dir.glob("*.gguf"):
 		old.unlink()
 	write_deploy_files(export_dir, spec, name, None, ctx, metrics)
+	has_refs = bool(referenced_ids(spec["schema"]))
+	if has_refs:
+		status.update(stage="Writing data set lists and grammar")
+		write_value_files(export_dir, spec, run_resolver(run_dir))
 
 	gguf_file = None
 	mmproj_file = None
@@ -309,9 +347,10 @@ def run_export(run_dir, status):
 					f"with: ollama create {name} --quantize {ollama_quantize} -f Modelfile"
 				)
 		write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file, image_tokens)
-		status.update(stage="Building grammar")
-		if not write_grammar(llama_dir, export_dir):
-			log("grammar.gbnf not generated (no Python schema converter in this llama.cpp); Ollama and llama-server use schema.json directly.")
+		if not has_refs:
+			status.update(stage="Building grammar")
+			if not write_grammar(llama_dir, export_dir):
+				log("grammar.gbnf not generated (no Python schema converter in this llama.cpp); Ollama and llama-server use schema.json directly.")
 
 	if merged_dir.exists() and not opts.get("keep_merged"):
 		shutil.rmtree(merged_dir, ignore_errors=True)

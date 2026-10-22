@@ -7,7 +7,7 @@ for image runs) from predict/request.json with greedy decoding and writes predic
 import os
 
 from . import vision
-from .fileio import read_json, read_jsonl, write_json
+from .fileio import JsonlRows, read_json, read_jsonl, write_json
 from .metrics import parse_generated
 from .prompts import FALLBACK_CHAT_TEMPLATE, format_output
 from .schema_tools import validate_output
@@ -53,7 +53,8 @@ def run_prediction(run_dir, status):
 	tokenizer = processor.tokenizer if plan.vision else processor
 
 	# Room for the longest answer seen in training, like the evaluation after training.
-	seen = read_jsonl(run_dir / "train.jsonl") + read_jsonl(run_dir / "eval.jsonl")
+	# A sample is enough to size the answer; a run can have hundreds of thousands of training rows.
+	seen = read_jsonl(run_dir / "eval.jsonl") + [row for _, row in zip(range(2000), JsonlRows(run_dir / "train.jsonl"))]
 	answer_tokens = max((len(tokenizer(format_output(r["output"]), add_special_tokens=False)["input_ids"]) for r in seen), default=256)
 	max_new = min(4096, int(answer_tokens * 1.5) + 32)
 

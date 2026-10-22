@@ -80,6 +80,12 @@
 .metric.good .metric-value { color: var(--good); }
 .metric.warn .metric-value { color: var(--warn); }
 .metric.bad .metric-value { color: var(--bad); }
+.metrics.ref-metrics { grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); }
+.ref-metrics .metric { padding: var(--sp-3) var(--sp-4); }
+.ref-metrics .metric-value { font-size: var(--fs-20); }
+.skipped > summary,
+.ref-values > summary { display: flex; align-items: center; gap: var(--sp-2); font-weight: 600; cursor: pointer; }
+.ref-values[open] > summary { margin-bottom: var(--sp-3); }
 
 .field-acc { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
 .good-chip-lite .count { color: var(--good); }
