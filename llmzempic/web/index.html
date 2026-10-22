@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>Llmzempic</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<header class="topbar">
+		<div class="brand">Llmzempic <span class="muted">structured-output fine-tuner</span></div>
+		<div id="hw" class="hw"></div>
+		<button id="settings-btn" class="ghost" type="button">Settings</button>
+	</header>
+
+	<div class="layout">
+		<aside class="sidebar">
+			<div class="side-head">
+				<h2>Projects</h2>
+				<button id="new-project-btn" type="button">+ New</button>
+			</div>
+			<ul id="project-list" class="project-list"></ul>
+			<div id="job-banner"></div>
+		</aside>
+
+		<main id="main">
+			<section id="welcome" class="welcome">
+				<h1>Make a small model that answers in your JSON</h1>
+				<ol>
+					<li><b>Task</b> - describe the job and the output structure (JSON Schema).</li>
+					<li><b>Examples</b> - add or import input → expected output pairs. 50-500 is typical.</li>
+					<li><b>Model</b> - pick an open-source base model; bigger is smarter but slower.</li>
+					<li><b>Train</b> - LoRA fine-tuning on your GPU, scored on held-out examples.</li>
+					<li><b>Export</b> - a GGUF model for Ollama or llama.cpp plus PHP, C# and Python clients.</li>
+				</ol>
+				<button id="welcome-new" type="button">Create a project</button>
+			</section>
+
+			<section id="project" hidden>
+				<div class="project-head">
+					<h1 id="project-title"></h1>
+					<span id="save-state" class="muted"></span>
+					<button id="delete-project" class="ghost danger" type="button">Delete project</button>
+				</div>
+				<nav class="tabs" id="tabs">
+					<button type="button" data-tab="task">1 · Task</button>
+					<button type="button" data-tab="examples">2 · Examples <span id="examples-count" class="pill"></span></button>
+					<button type="button" data-tab="model">3 · Model</button>
+					<button type="button" data-tab="train">4 · Train</button>
+					<button type="button" data-tab="export">5 · Export</button>
+				</nav>
+
+				<div class="tab" id="tab-task">
+					<label>Project name <input id="cfg-name" type="text"></label>
+					<label>Instructions <span class="muted">what the model should do with each input</span>
+						<textarea id="cfg-instructions" rows="4"></textarea>
+					</label>
+					<div class="row-between">
+						<h3>Output structure <span class="muted">(JSON Schema)</span></h3>
+						<div class="row">
+							<select id="template-select"><option value="">Start from a template…</option></select>
+							<button id="infer-schema" class="ghost" type="button">Infer from examples</button>
+						</div>
+					</div>
+					<textarea id="cfg-schema" class="code" rows="16" spellcheck="false"></textarea>
+					<div id="schema-errors" class="errors"></div>
+					<label class="check"><input id="cfg-include-schema" type="checkbox"> Include the schema in the system prompt (recommended)</label>
+					<details>
+						<summary>System prompt the model is trained and deployed with</summary>
+						<pre id="system-prompt" class="code-block"></pre>
+					</details>
+				</div>
+
+				<div class="tab" id="tab-examples" hidden>
+					<div class="toolbar">
+						<button id="add-example" type="button">+ Add example</button>
+						<button id="import-btn" class="ghost" type="button">Import JSONL / CSV / JSON…</button>
+						<select id="import-mode">
+							<option value="append">append</option>
+							<option value="replace">replace all</option>
+						</select>
+						<input id="import-file" type="file" accept=".jsonl,.json,.csv,.tsv,.txt" hidden>
+						<button id="download-examples" class="ghost" type="button">Download JSONL</button>
+						<select id="examples-filter">
+							<option value="all">Show all</option>
+							<option value="invalid">Show only problems</option>
+						</select>
+						<span id="examples-summary" class="muted"></span>
+					</div>
+					<p class="hint">Each example is an input text and the exact JSON the model should return. Imports accept
+						<code>{"input": "...", "output": {...}}</code> lines, OpenAI <code>messages</code> records, or a CSV with an
+						<code>input</code> column plus an <code>output</code> JSON column or one column per output field.</p>
+					<div id="import-warnings" class="errors"></div>
+					<div id="examples-list"></div>
+					<div id="examples-pager" class="pager"></div>
+					<input id="input-file" type="file" hidden>
+				</div>
+
+				<div class="tab" id="tab-model" hidden>
+					<p id="model-hw" class="hint"></p>
+					<div id="model-table"></div>
+					<label>Base model <span class="muted">pick above, or enter any Hugging Face model id or local folder</span>
+						<input id="cfg-base-model" type="text" spellcheck="false">
+					</label>
+					<h3>Training</h3>
+					<div class="segmented" id="presets"></div>
+					<details id="advanced">
+						<summary>Advanced settings</summary>
+						<div class="grid" id="training-fields"></div>
+					</details>
+				</div>
+
+				<div class="tab" id="tab-train" hidden>
+					<div id="readiness" class="readiness"></div>
+					<div class="row">
+						<button id="start-training" type="button">Start training</button>
+						<span id="train-msg" class="muted"></span>
+					</div>
+					<h3>Runs</h3>
+					<div id="runs-table"></div>
+					<div id="run-detail"></div>
+				</div>
+
+				<div class="tab" id="tab-export" hidden>
+					<div id="export-body"></div>
+				</div>
+			</section>
+		</main>
+	</div>
+
+	<dialog id="new-project-dialog">
+		<form method="dialog" id="new-project-form">
+			<h2>New project</h2>
+			<label>Name <input id="new-project-name" type="text" required placeholder="Support ticket router"></label>
+			<label>Start from <select id="new-project-template"></select></label>
+			<div class="row end">
+				<button value="cancel" class="ghost" type="button" id="new-project-cancel">Cancel</button>
+				<button value="create" type="submit">Create</button>
+			</div>
+		</form>
+	</dialog>
+
+	<dialog id="settings-dialog">
+		<form method="dialog" id="settings-form">
+			<h2>Settings</h2>
+			<label>Hugging Face token <span class="muted">needed for gated models (Llama, Gemma)</span>
+				<input id="set-hf-token" type="password" autocomplete="off" placeholder="hf_…">
+			</label>
+			<label>llama.cpp folder <span class="muted">optional; downloaded automatically when empty</span>
+				<input id="set-llama" type="text" spellcheck="false">
+			</label>
+			<p id="set-workspace" class="hint"></p>
+			<div class="row end">
+				<button class="ghost" type="button" id="settings-cancel">Cancel</button>
+				<button type="submit">Save</button>
+			</div>
+		</form>
+	</dialog>
+
+	<div id="toast" role="status"></div>
+	<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmzempic"
+version = "0.1.0"
+description = "Fine-tune open-source LLMs into small, reliable structured-output models."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+	"fastapi>=0.110",
+	"uvicorn>=0.27",
+	"jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+# Install PyTorch first (CUDA build on NVIDIA machines), then `pip install -e .[train]`.
+train = [
+	"torch>=2.3",
+	"transformers>=4.45",
+	"peft>=0.12",
+	"accelerate>=0.34",
+	"safetensors>=0.4",
+	"sentencepiece>=0.2",
+	"protobuf>=4",
+	"gguf>=0.10",
+	"numpy",
+]
+# 4-bit QLoRA on NVIDIA GPUs.
+cuda = ["bitsandbytes>=0.43"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+llmzempic = "llmzempic.cli:main"
+
+[tool.setuptools]
+packages = ["llmzempic"]
+
+[tool.setuptools.package-data]
+llmzempic = ["catalog.json", "web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
