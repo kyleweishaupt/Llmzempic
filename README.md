@@ -2,10 +2,10 @@
 
 Turn an open-source LLM into a small, specialized model that answers with **structured JSON your
 applications can use for logic**: a PHP site that classifies text, a C# desktop app that analyzes
-files and gets a reliable report back.
+files and gets a reliable report back, or an image check ("does this photo contain a hot dog?").
 
-You describe the task, define the output with a JSON Schema, add examples, pick a base model and
-train. Llmzempic fine-tunes with LoRA/QLoRA on your GPU, scores the result on held-out examples,
+You describe the task, design the output in a visual editor (it's a JSON Schema underneath), add
+examples (text or images), pick a base model and train. Llmzempic fine-tunes with LoRA/QLoRA on your GPU, scores the result on held-out examples,
 and exports a GGUF model plus ready-to-paste PHP, C# and Python clients.
 
 Runs on **Windows and Linux** (Python 3.10+). The UI is a local web page; nothing leaves your
@@ -18,8 +18,8 @@ machine except model downloads from Hugging Face.
 | Install | `setup.cmd` | `./setup.sh` |
 | Run | `start.cmd` | `./start.sh` |
 
-Setup creates `.venv`, installs PyTorch (the CUDA build when `nvidia-smi` is found, otherwise the
-CPU build) and the training libraries. The UI opens at <http://localhost:7870>. Projects are
+Setup creates `.venv`, installs PyTorch and torchvision (the CUDA build when `nvidia-smi` is
+found, otherwise the CPU build) and the training libraries. The UI opens at <http://localhost:7870>. Projects are
 stored in `~/Llmzempic` (`%USERPROFILE%\Llmzempic` on Windows); change it with `--workspace` or
 the `LLMZEMPIC_HOME` environment variable.
 
@@ -30,31 +30,45 @@ then `pip install -e .[train,cuda]`.
 
 ## Workflow
 
-1. **Task** - write instructions ("Classify the support ticket…") and the output JSON Schema.
-	Start from a template (classification, tagging, field extraction, file analysis, sentiment)
-	or infer the schema from your examples.
-2. **Examples** - add input → expected-output pairs by hand, load an input from a file, or import:
+1. **Task** - choose the input (text, or images with optional text), write instructions
+	("Classify the support ticket…") and design the answer. The visual editor covers text, numbers,
+	yes/no, one or several of a list of options, lists and nested groups, with a live preview of the
+	answer; switch to the raw JSON Schema for anything else. Start from a template (classification,
+	tagging, field extraction, file analysis, sentiment, image yes/no, image classification) or infer
+	the schema from your examples.
+2. **Examples** - each answer is edited with a form generated from the schema (or as JSON).
+	Text examples are added by hand, loaded from a file, or imported:
 	- JSONL: `{"input": "...", "output": {...}}` per line (also `prompt`/`completion`, or OpenAI
 		`{"messages": [...]}` records)
 	- JSON array of the same objects
 	- CSV/TSV: an `input` (or `text`) column plus either an `output` JSON column or one column per
 		output field, typed using the schema
 
+	Image projects: drop, paste or choose a batch of images and give the whole batch its answer
+	(add the hot dogs as "yes", then the rest as "no"). Big photos are rotated per their EXIF data
+	and shrunk to 1280 px in the browser before upload; identical images are stored once. The gallery
+	has answer buttons on every card, Shift-click range selection to set an answer for or delete many
+	at once (with undo), and a full-size review view for fast labeling: `1`-`9` set the first yes/no
+	or option field and move on, `←`/`→` browse, `Del` deletes.
+
 	Every output is validated against the schema; training won't start until they all match.
 	20 examples is a minimum, 100-500 covering every label and edge case is better. The tab counts
 	examples per label (enum, boolean and tag fields) and flags labels with no examples and inputs
 	that appear more than once, especially copies with different outputs.
-3. **Model** - pick a base model. Each one shows whether it fits your GPU. Bigger is smarter but
+3. **Model** - pick a base model: text models for text projects, vision models (SmolVLM, Qwen3-VL)
+	for image projects. Each one shows whether it fits your GPU. Bigger is smarter but
 	slower to train and run. Any Hugging Face model id or local folder works too.
 4. **Train** - presets (Quick / Balanced / Thorough) or advanced settings. Live loss chart and log.
 	When training ends the model is scored on held-out examples: valid JSON, matches schema, and
 	exact match, with per-example predictions. Held-out examples are picked in proportion for each
 	value of the first enum or boolean field, and copies of an input stay on the same side. Enum,
 	boolean and tag fields also get a per-label breakdown (how often each value is recognized,
-	precision) and the most common mix-ups. **Try it** runs a finished model on your own input;
-	"Add as example" turns the answer into a new example to correct, so mistakes feed the next run.
+	precision) and the most common mix-ups. **Try it** runs a finished model on your own input or
+	image; "Add as example" turns the answer into a new example to correct, so mistakes feed the next
+	run.
 5. **Export** - creates a GGUF model (Q8_0 by default), an Ollama `Modelfile`, the schema, the
-	exact system prompt, a manifest, and client code. Optionally registers it with Ollama.
+	exact system prompt, a manifest, and client code. Image models also get their image encoder as
+	`mmproj-<name>-f16.gguf`. Optionally registers the model with Ollama.
 
 ## Using the model from your code
 
@@ -68,7 +82,11 @@ result classes generated from the schema) and a Python client. They call the mod
 	(`integration/llama-server-request.json` is a complete example). This is a single executable you
 	can ship next to a desktop app.
 
-Both clients pass the JSON Schema to the server, which constrains decoding so every response is
+For image models the clients take an image path (plus optional text) and send the image base64
+encoded (Ollama `images`, llama-server `image_url`); run llama-server with `--mmproj` as shown in the
+export's README.
+
+The clients pass the JSON Schema to the server, which constrains decoding so every response is
 schema-valid JSON. Fine-tuning makes the *content* right; constrained decoding guarantees the
 *shape*. Use temperature 0 for deterministic answers.
 
@@ -77,7 +95,9 @@ schema-valid JSON. Fine-tuning makes the *content* right; constrained decoding g
 - LoRA trains well under 1% of the weights, and the loss covers only the JSON answer, not the prompt.
 - On NVIDIA GPUs: bf16/fp16, fused AdamW, gradient checkpointing, dynamic padding. "Auto"
 	quantization switches to 4-bit QLoRA when the model wouldn't fit in VRAM at 16-bit.
-- Unsloth is used automatically when installed.
+- Unsloth is used automatically when installed (text models).
+- Images are capped at about 256 tokens each. LoRA trains the language layers; the vision encoder
+	stays frozen and isn't quantized in 4-bit mode.
 - Training and export run in a separate process, so the UI stays responsive and GPU memory is
 	freed when a job ends. One job runs at a time.
 - CPU-only machines can train tiny models (SmolLM2, Qwen2.5 0.5B) for testing; use a GPU for
@@ -90,6 +110,7 @@ llmzempic                         # web UI (same as `llmzempic ui`)
 llmzempic ui --port 8000 --no-browser
 llmzempic train <project>         # train without the UI
 llmzempic try <run folder> "text" # answer an input with a trained run
+llmzempic try <run folder> --image photo.jpg   # image runs; repeat --image for more
 llmzempic export <run folder> --gguf q4_k_m --ollama
 llmzempic doctor                  # detected GPU, memory and libraries
 ```
@@ -111,6 +132,7 @@ python -m venv .venv && .venv/bin/python -m pip install -e .[dev]
 .venv/bin/python -m pytest
 ```
 
-Layout: `llmzempic/server.py` (API), `web/` (UI, no build step), `trainer.py` and `exporter.py`
-(run in the worker process), `runs.py` and `workspace.py` (on-disk projects),
-`catalog.json` (base model list).
+Layout: `llmzempic/server.py` and `image_api.py` (API), `web/` (UI: `index.html`, `css/` and
+`js/` ES modules, no build step), `trainer.py`, `vision.py` and `exporter.py` (run in the worker
+process), `runs.py`, `workspace.py` and `images.py` (on-disk projects), `catalog.json` (base model
+list).

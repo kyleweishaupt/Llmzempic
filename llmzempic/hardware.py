@@ -37,6 +37,8 @@ print(json.dumps(info))
 """
 
 _TRAIN_PACKAGES = ["torch", "transformers", "peft", "accelerate", "safetensors"]
+# Image projects also decode images (Pillow); Qwen-VL processors need torchvision.
+_IMAGE_PACKAGES = ["pillow", "torchvision"]
 
 
 def _version(dist):
@@ -88,8 +90,9 @@ def probe_torch(timeout=120):
 
 def detect():
 	torch_info = probe_torch()
-	packages = {p: _version(p) for p in _TRAIN_PACKAGES + ["bitsandbytes", "unsloth"]}
+	packages = {p: _version(p) for p in _TRAIN_PACKAGES + _IMAGE_PACKAGES + ["bitsandbytes", "unsloth"]}
 	missing = [p for p in _TRAIN_PACKAGES if not packages[p]]
+	missing_image = [p for p in _IMAGE_PACKAGES if not packages[p]]
 	gpus = torch_info.get("gpus") or []
 	if torch_info.get("cuda") and gpus:
 		device = "cuda"
@@ -111,6 +114,8 @@ def detect():
 		"packages": packages,
 		"missing_train_packages": missing,
 		"can_train": torch_info.get("torch_ok", False) and not missing,
+		"missing_image_packages": missing_image,
+		"can_train_images": torch_info.get("torch_ok", False) and not missing and not missing_image,
 		"can_4bit": device == "cuda" and bool(packages["bitsandbytes"]),
 		"can_unsloth": device == "cuda" and bool(packages["unsloth"]),
 		"ollama": shutil.which("ollama"),

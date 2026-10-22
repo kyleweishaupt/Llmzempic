@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .data import normalize_example
 from .fileio import read_json, read_jsonl, write_json, write_jsonl
+from .images import remove_orphans
 from .schema_tools import get_template
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
@@ -51,9 +52,11 @@ def slugify(name):
 
 def default_config(name="", template_id="classification"):
 	template = get_template(template_id)
+	input_kind = template.get("input_kind", "text")
 	return {
 		"name": name,
-		"base_model": "Qwen/Qwen2.5-1.5B-Instruct",
+		"base_model": recommended_model(input_kind),
+		"input_kind": input_kind,
 		"instructions": template["instructions"],
 		"schema": copy.deepcopy(template["schema"]),
 		"include_schema_in_prompt": True,
@@ -78,6 +81,10 @@ class Project:
 	def runs_dir(self):
 		return self.path / "runs"
 
+	@property
+	def images_dir(self):
+		return self.path / "images"
+
 	def load_config(self):
 		stored = read_json(self.config_path, {}) or {}
 		config = default_config(stored.get("name") or self.id)
@@ -99,6 +106,7 @@ class Project:
 	def save_examples(self, examples):
 		rows = [normalize_example(e) for e in examples]
 		write_jsonl(self.examples_path, rows)
+		remove_orphans(self.images_dir, {r["image"] for r in rows if r.get("image")})
 		return rows
 
 	def run_path(self, run_id):
@@ -189,6 +197,12 @@ class Workspace:
 def load_catalog():
 	with open(Path(__file__).with_name("catalog.json"), "r", encoding="utf-8") as f:
 		return json.load(f)["models"]
+
+
+def recommended_model(input_kind="text"):
+	vision = input_kind == "image"
+	models = [m for m in load_catalog() if bool(m.get("vision")) == vision] or load_catalog()
+	return next((m["id"] for m in models if m.get("recommended")), models[0]["id"])
 
 
 def catalog_entry(model_id):

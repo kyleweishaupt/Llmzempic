@@ -31,10 +31,27 @@ def validate_output(value, schema):
 	errors = []
 	for err in sorted(validator.iter_errors(value), key=lambda e: list(e.absolute_path)):
 		where = "/".join(str(p) for p in err.absolute_path)
-		errors.append(f"{where or '(root)'}: {err.message}")
+		message = _readable(err)
+		errors.append(f"{where}: {message}" if where else message)
 		if len(errors) >= 5:
 			break
 	return errors
+
+
+def _readable(err):
+	"""Plain-language versions of the messages people hit most while labeling."""
+	if err.validator == "required" and isinstance(err.instance, dict):
+		missing = [k for k in err.validator_value if k not in err.instance]
+		if missing:
+			return f"Missing {', '.join(missing)}"
+	if err.validator == "additionalProperties" and isinstance(err.instance, dict):
+		known = set((err.schema.get("properties") or {}))
+		extra = [k for k in err.instance if k not in known]
+		if extra:
+			return f"Not in the schema: {', '.join(extra)}"
+	if err.validator == "enum":
+		return f"{compact_json(err.instance)} isn't one of {', '.join(compact_json(v) for v in err.validator_value)}"
+	return err.message
 
 
 def _kind(value):
@@ -156,7 +173,8 @@ def coerce_value(raw, prop_schema):
 TEMPLATES = [
 	{
 		"id": "classification",
-		"name": "Classification (one label)",
+		"name": "Classification",
+		"description": "Sort text into exactly one category.",
 		"instructions": "Classify the text into exactly one category.",
 		"schema": {
 			"type": "object",
@@ -169,7 +187,8 @@ TEMPLATES = [
 	},
 	{
 		"id": "multilabel",
-		"name": "Tagging (multiple labels)",
+		"name": "Tagging",
+		"description": "Assign every tag that applies.",
 		"instructions": "Assign every tag that applies to the text.",
 		"schema": {
 			"type": "object",
@@ -186,6 +205,7 @@ TEMPLATES = [
 	{
 		"id": "extraction",
 		"name": "Field extraction",
+		"description": "Pull named fields out of a document.",
 		"instructions": "Extract the requested fields from the document. Use null when a field is not present.",
 		"schema": {
 			"type": "object",
@@ -202,6 +222,7 @@ TEMPLATES = [
 	{
 		"id": "file-analysis",
 		"name": "File analysis report",
+		"description": "Type, summary and a list of issues.",
 		"instructions": "Analyze the file contents and report its type, a short summary and any problems found.",
 		"schema": {
 			"type": "object",
@@ -228,6 +249,7 @@ TEMPLATES = [
 	{
 		"id": "sentiment",
 		"name": "Sentiment with score",
+		"description": "Positive, neutral or negative, rated 1 to 5.",
 		"instructions": "Rate the sentiment of the text.",
 		"schema": {
 			"type": "object",
@@ -236,6 +258,36 @@ TEMPLATES = [
 				"score": {"type": "integer", "minimum": 1, "maximum": 5},
 			},
 			"required": ["sentiment", "score"],
+			"additionalProperties": False,
+		},
+	},
+	{
+		"id": "image-yes-no",
+		"name": "Image yes/no check",
+		"description": "Does the picture show the thing you care about?",
+		"input_kind": "image",
+		"instructions": "Decide whether the image shows or contains a hot dog.",
+		"schema": {
+			"type": "object",
+			"properties": {
+				"hot_dog": {"type": "boolean", "description": "true when the image shows or contains a hot dog"},
+			},
+			"required": ["hot_dog"],
+			"additionalProperties": False,
+		},
+	},
+	{
+		"id": "image-classification",
+		"name": "Image classification",
+		"description": "Sort pictures into exactly one category.",
+		"input_kind": "image",
+		"instructions": "Classify what the image mainly shows into exactly one category.",
+		"schema": {
+			"type": "object",
+			"properties": {
+				"label": {"type": "string", "enum": ["food", "person", "animal", "other"]},
+			},
+			"required": ["label"],
 			"additionalProperties": False,
 		},
 	},

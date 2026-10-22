@@ -16,9 +16,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Install PyTorch first (CUDA build on NVIDIA machines), then `pip install -e .[train]`.
+# Install PyTorch and torchvision first, from the same index (CUDA build on NVIDIA machines),
+# then `pip install -e .[train]`.
 train = [
 	"torch>=2.3",
+	"torchvision",
+	"pillow>=10",
 	"transformers>=4.45",
 	"peft>=0.12",
 	"accelerate>=0.34",
@@ -39,7 +42,7 @@ llmzempic = "llmzempic.cli:main"
 packages = ["llmzempic"]
 
 [tool.setuptools.package-data]
-llmzempic = ["catalog.json", "web/*"]
+llmzempic = ["catalog.json", "web/*", "web/css/*", "web/js/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

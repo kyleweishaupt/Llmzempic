@@ -19,7 +19,8 @@ where nvidia-smi >nul 2>nul && (
 )
 if not defined TORCH_INDEX_URL set "TORCH_INDEX_URL=%DEFAULT_INDEX%"
 echo Installing PyTorch from %TORCH_INDEX_URL%
-"%VPY%" -m pip install torch --index-url %TORCH_INDEX_URL% || goto :fail
+rem torchvision comes from the same index so its build matches torch (image models need it).
+"%VPY%" -m pip install torch torchvision --index-url %TORCH_INDEX_URL% || goto :fail
 "%VPY%" -m pip install -e ".[%EXTRAS%]" || goto :fail
 if "%WITH_UNSLOTH%"=="1" "%VPY%" -m pip install unsloth || goto :fail
 

@@ -28,11 +28,14 @@ def parse_output(value):
 
 
 def normalize_example(example):
-	return {
+	row = {
 		"id": str(example.get("id") or new_id()),
 		"input": "" if example.get("input") is None else str(example.get("input")),
 		"output": parse_output(example.get("output")),
 	}
+	if example.get("image"):
+		row["image"] = str(example["image"])
+	return row
 
 
 def _pick(record, keys):
@@ -52,7 +55,8 @@ def _from_record(record, schema):
 		return {"input": user[-1], "output": parse_output(assistant[-1])}
 
 	input_key = _pick(record, INPUT_KEYS)
-	if input_key is None:
+	image_key = _pick(record, ("image",))
+	if input_key is None and image_key is None:
 		raise ValueError(f"no input field (expected one of: {', '.join(INPUT_KEYS)})")
 	output_key = _pick(record, OUTPUT_KEYS)
 	if output_key is not None:
@@ -62,12 +66,16 @@ def _from_record(record, schema):
 		props = (schema or {}).get("properties") or {}
 		output = {}
 		for key, value in record.items():
-			if key == input_key or key == "id":
+			if key in (input_key, image_key, "id"):
 				continue
 			output[key] = coerce_value(value, props.get(key)) if isinstance(value, str) else value
 		if not output:
 			raise ValueError("no output field or output columns")
-	return {"input": record[input_key], "output": output}
+	return {
+		"input": record[input_key] if input_key else "",
+		"output": output,
+		"image": record[image_key] if image_key else None,
+	}
 
 
 def parse_examples(text, filename="", schema=None):

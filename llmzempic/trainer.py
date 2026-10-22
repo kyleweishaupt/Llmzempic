@@ -12,6 +12,7 @@ import os
 import shutil
 import time
 
+from . import vision
 from .fileio import append_jsonl, read_json, read_jsonl, write_json
 from .hardware import estimate_memory_gb
 from .metrics import score_predictions
@@ -60,9 +61,13 @@ class Plan:
 			log("4-bit needs an NVIDIA GPU with bitsandbytes installed; training in 16-bit instead.")
 
 		accel = t.get("accelerator", "auto")
-		self.unsloth = self.cuda and accel in ("auto", "unsloth") and importlib.util.find_spec("unsloth") is not None
+		self.vision = vision.is_vision(spec)
+		self.unsloth = (
+			self.cuda and not self.vision and accel in ("auto", "unsloth") and importlib.util.find_spec("unsloth") is not None
+		)
 		if accel == "unsloth" and not self.unsloth:
-			log("Unsloth was requested but needs an NVIDIA GPU and `pip install unsloth`; using standard PEFT.")
+			reason = "isn't used for image projects" if self.vision else "needs an NVIDIA GPU and `pip install unsloth`"
+			log(f"Unsloth was requested but {reason}; using standard PEFT.")
 
 		if self.cuda and torch.cuda.is_bf16_supported():
 			self.precision, self.dtype = "bf16", torch.bfloat16
@@ -113,13 +118,10 @@ class PadCollator:
 		}
 
 
-def load_standard(spec, plan):
+def model_kwargs(plan):
+	"""from_pretrained() arguments for the training/inference device, dtype and 4-bit plan."""
 	import transformers
-	from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-	from transformers import AutoModelForCausalLM, AutoTokenizer
 
-	t = spec["training"]
-	tokenizer = AutoTokenizer.from_pretrained(spec["base_model"], token=hf_token())
 	kwargs = {"token": hf_token(), dtype_kwarg(transformers): plan.dtype}
 	if plan.four_bit:
 		from transformers import BitsAndBytesConfig
@@ -128,10 +130,25 @@ def load_standard(spec, plan):
 			bnb_4bit_quant_type="nf4",
 			bnb_4bit_use_double_quant=True,
 			bnb_4bit_compute_dtype=plan.dtype,
+			# The vision encoder is small and frozen; quantizing it only costs image understanding.
+			llm_int8_skip_modules=["lm_head", "vision", "visual", "connector", "projector", "merger"] if plan.vision else None,
 		)
 	if plan.cuda:
 		kwargs["device_map"] = {"": 0}
-	model = AutoModelForCausalLM.from_pretrained(spec["base_model"], **kwargs)
+	return kwargs
+
+
+def load_standard(spec, plan):
+	from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+	from transformers import AutoModelForCausalLM, AutoTokenizer
+
+	t = spec["training"]
+	if plan.vision:
+		processor = vision.load_processor(spec["base_model"], hf_token())
+		model = vision.load_model(spec["base_model"], model_kwargs(plan))
+	else:
+		processor = AutoTokenizer.from_pretrained(spec["base_model"], token=hf_token())
+		model = AutoModelForCausalLM.from_pretrained(spec["base_model"], **model_kwargs(plan))
 	if plan.four_bit:
 		model = prepare_model_for_kbit_training(
 			model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -143,8 +160,9 @@ def load_standard(spec, plan):
 		bias="none",
 		task_type="CAUSAL_LM",
 		target_modules="all-linear",
+		exclude_modules=vision.VISION_MODULES if plan.vision else None,
 	)
-	return get_peft_model(model, lora), tokenizer
+	return get_peft_model(model, lora), processor
 
 
 def load_unsloth(spec, plan):
@@ -192,6 +210,17 @@ def generate(model, tokenizer, system_prompt, inputs, max_new_tokens, batch_size
 	return texts
 
 
+def answer(model, processor, spec, rows, images_dir, max_new_tokens, batch_size, torch):
+	"""Greedy answers for rows of {"input"} (text runs) or {"input", "image"} (image runs)."""
+	if vision.is_vision(spec):
+		return vision.generate(model, processor, spec["system_prompt"], rows, images_dir, max_new_tokens, batch_size, torch)
+	return generate(model, processor, spec["system_prompt"], [r["input"] for r in rows], max_new_tokens, batch_size, torch)
+
+
+def feature_length(feature):
+	return feature["length"] if "length" in feature else len(feature["input_ids"])
+
+
 def run_training(run_dir, status):
 	os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 	os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -214,27 +243,36 @@ def run_training(run_dir, status):
 	log(f"Base model: {spec['base_model']}")
 	log(f"Plan: {plan.describe()}")
 	status.update(stage="Loading base model (first use downloads it)", plan=plan.describe())
-	model, tokenizer = load_unsloth(spec, plan) if plan.unsloth else load_standard(spec, plan)
+	model, processor = load_unsloth(spec, plan) if plan.unsloth else load_standard(spec, plan)
+	tokenizer = processor.tokenizer if plan.vision else processor
 	if tokenizer.pad_token is None:
 		tokenizer.pad_token = tokenizer.eos_token
-	if not getattr(tokenizer, "chat_template", None):
+	if not plan.vision and not getattr(tokenizer, "chat_template", None):
 		log("Base model has no chat template; using a simple '### Role:' template.")
 		tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
 	tokenizer.padding_side = "right"
 
-	status.update(stage="Tokenizing examples")
-	train_features = tokenize_rows(tokenizer, system_prompt, train_rows)
-	eval_features = tokenize_rows(tokenizer, system_prompt, eval_rows)
+	if plan.vision:
+		status.update(stage="Preparing images")
+		images_dir = run_dir / "images"
+		train_features = vision.build_features(processor, system_prompt, train_rows, images_dir, log)
+		eval_features = vision.build_features(processor, system_prompt, eval_rows, images_dir, log)
+		collator = vision.VisionCollator(processor, model)
+	else:
+		status.update(stage="Tokenizing examples")
+		train_features = tokenize_rows(tokenizer, system_prompt, train_rows)
+		eval_features = tokenize_rows(tokenizer, system_prompt, eval_rows)
+		collator = PadCollator(tokenizer.pad_token_id, 8 if plan.cuda else None)
 	max_len = int(t.get("max_seq_length") or 0)
 	if max_len:
 		before = len(train_features)
-		train_features = [f for f in train_features if len(f["input_ids"]) <= max_len]
-		eval_features = [f for f in eval_features if len(f["input_ids"]) <= max_len]
+		train_features = [f for f in train_features if feature_length(f) <= max_len]
+		eval_features = [f for f in eval_features if feature_length(f) <= max_len]
 		if len(train_features) < before:
 			log(f"Skipped {before - len(train_features)} training example(s) longer than {max_len} tokens.")
 	if not train_features:
 		raise RuntimeError("Every training example is longer than the max sequence length.")
-	longest = max(len(f["input_ids"]) for f in train_features + eval_features)
+	longest = max(feature_length(f) for f in train_features + eval_features)
 	log(f"{len(train_features)} training / {len(eval_features)} eval examples, longest {longest} tokens")
 	if longest > 4096:
 		log("Long examples use a lot of memory; lower the batch size if you run out of memory.")
@@ -305,7 +343,7 @@ def run_training(run_dir, status):
 		args=args,
 		train_dataset=train_features,
 		eval_dataset=eval_features or None,
-		data_collator=PadCollator(tokenizer.pad_token_id, 8 if plan.cuda else None),
+		data_collator=collator,
 		callbacks=[Progress()],
 	)
 	try:
@@ -320,7 +358,8 @@ def run_training(run_dir, status):
 	status.update(stage="Saving adapter")
 	adapter_dir = run_dir / "adapter"
 	model.save_pretrained(str(adapter_dir))
-	tokenizer.save_pretrained(str(adapter_dir))
+	# Image runs save the whole processor: tokenizer, chat template and the capped image size.
+	processor.save_pretrained(str(adapter_dir))
 	shutil.rmtree(run_dir / "checkpoints", ignore_errors=True)
 	log(f"Saved LoRA adapter to {adapter_dir}")
 
@@ -335,7 +374,7 @@ def run_training(run_dir, status):
 	answer_tokens = max(len(tokenizer(format_output(r["output"]), add_special_tokens=False)["input_ids"]) for r in train_rows + eval_rows)
 	max_new = min(4096, int(answer_tokens * 1.5) + 32)
 	log(f"Evaluating on {len(rows)} {eval_on}")
-	texts = generate(model, tokenizer, system_prompt, [r["input"] for r in rows], max_new, max(1, batch_size), torch)
+	texts = answer(model, processor, spec, rows, run_dir / "images", max_new, max(1, batch_size), torch)
 	evaluation = score_predictions(rows, texts, spec["schema"])
 	evaluation["eval_on"] = eval_on
 	write_json(run_dir / "eval.json", evaluation)

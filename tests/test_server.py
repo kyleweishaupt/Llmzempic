@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -7,7 +9,7 @@ from llmzempic.workspace import Workspace
 
 HARDWARE = {
 	"device": "cpu", "gpus": [], "vram_gb": 0, "ram_gb": 16, "can_train": True, "can_4bit": False,
-	"can_unsloth": False, "missing_train_packages": [], "ollama": None,
+	"can_unsloth": False, "missing_train_packages": [], "ollama": None, "can_train_images": True, "missing_image_packages": [],
 }
 
 
@@ -49,7 +51,9 @@ def test_static_ui_served(env):
 	res = client.get("/")
 	assert res.status_code == 200
 	assert "Llmzempic" in res.text
-	assert client.get("/app.js").status_code == 200
+	assert client.get("/js/main.js").status_code == 200
+	assert client.get("/css/tokens.css").status_code == 200
+	assert res.headers["cache-control"] == "no-cache"
 
 
 def test_catalog_includes_fit(env):
@@ -81,7 +85,7 @@ def test_project_flow_to_training_and_export(env):
 
 	res = client.post(f"/api/projects/{pid}/runs")
 	assert res.status_code == 400
-	assert "don't match" in res.json()["detail"]
+	assert "have problems" in res.json()["detail"]
 
 	client.put(f"/api/projects/{pid}/examples", json={"examples": examples[:-1]})
 	res = client.post(f"/api/projects/{pid}/runs")
@@ -177,3 +181,73 @@ def test_unknown_ids_are_rejected(env):
 			ws.get(bad)
 		with pytest.raises(KeyError):
 			ws.get(pid).run_path(bad)
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16  # the server only checks the file signature
+
+
+def test_image_project_flow(env):
+	client, ws, jobs = env
+	view = client.post("/api/projects", json={"name": "Hot dog", "template": "image-yes-no"}).json()
+	pid = view["id"]
+	assert view["config"]["input_kind"] == "image"
+
+	assert client.post(f"/api/projects/{pid}/images", content=b"GIF? no").status_code == 400
+	names = [client.post(f"/api/projects/{pid}/images", content=PNG + bytes([i])).json()["name"] for i in range(12)]
+	assert len(set(names)) == 12
+	assert client.post(f"/api/projects/{pid}/images", content=PNG + bytes([0])).json()["name"] == names[0]
+	res = client.get(f"/api/projects/{pid}/images/{names[0]}")
+	assert res.status_code == 200 and res.headers["content-type"] == "image/png" and res.content == PNG + bytes([0])
+	assert client.get(f"/api/projects/{pid}/images/..%2Fproject.json").status_code == 404
+
+	examples = [{"input": "", "image": n, "output": {"hot_dog": i % 2 == 0}} for i, n in enumerate(names)]
+	missing = [{"input": "no picture", "output": {"hot_dog": True}}, {"input": "", "image": "0" * 24 + ".png", "output": {"hot_dog": True}}]
+	data = client.put(f"/api/projects/{pid}/examples", json={"examples": examples + missing}).json()
+	assert sorted(i["errors"][0] for i in data["invalid"]) == ["Image file is missing", "No image"]
+	assert data["examples"][0]["image"] == names[0]
+
+	# The UI's JSONL download carries image names; importing it back keeps them.
+	jsonl = "\n".join(json.dumps({"input": "", "image": n, "output": {"hot_dog": True}}) for n in names[:2])
+	data = client.post(f"/api/projects/{pid}/import", json={"text": jsonl, "filename": "x.jsonl", "mode": "replace"}).json()
+	assert [e["image"] for e in data["examples"]] == names[:2] and data["invalid"] == []
+
+	client.put(f"/api/projects/{pid}/examples", json={"examples": examples})
+	client.put(f"/api/projects/{pid}", json={"config": {"base_model": "Qwen/Qwen2.5-1.5B-Instruct"}})
+	res = client.post(f"/api/projects/{pid}/runs")
+	assert res.status_code == 400 and "can't read images" in res.json()["detail"]
+
+	client.put(f"/api/projects/{pid}", json={"config": {"base_model": "someone/custom-vlm"}})
+	res = client.post(f"/api/projects/{pid}/runs")
+	assert res.status_code == 200, res.text
+	run_id = res.json()["id"]
+	assert res.json()["input_kind"] == "image"
+	run_dir = ws.get(pid).runs_dir / run_id
+	assert sorted(p.name for p in (run_dir / "images").iterdir()) == sorted(names)
+	assert read_json(run_dir / "run.json")["input_kind"] == "image"
+	assert all(r["image"] in names for r in read_jsonl(run_dir / "train.jsonl"))
+	assert client.get(f"/api/projects/{pid}/runs/{run_id}/images/{names[3]}").status_code == 200
+
+	write_json(run_dir / "status.json", {"state": "completed"})
+	(run_dir / "adapter").mkdir()
+	predict = f"/api/projects/{pid}/runs/{run_id}/predict"
+	assert client.post(predict, json={"inputs": [""]}).status_code == 400
+	assert client.post(predict, json={"inputs": [""], "images": ["0" * 24 + ".png"]}).status_code == 400
+	fresh = client.post(f"/api/projects/{pid}/images", content=PNG + b"new").json()["name"]
+	res = client.post(predict, json={"inputs": [""], "images": [fresh]})
+	assert res.status_code == 200, res.text
+	assert read_json(run_dir / "predict" / "request.json") == {"inputs": [""], "images": [fresh]}
+	assert (run_dir / "images" / fresh).exists()
+
+
+def test_orphaned_images_are_removed_once_stale(tmp_path):
+	import os
+	import time
+
+	from llmzempic.images import remove_orphans, save_image
+
+	used, fresh, stale = (save_image(tmp_path, PNG + bytes([i])) for i in range(3))
+	old = time.time() - 2 * 24 * 3600
+	for name in (used, stale):
+		os.utime(tmp_path / name, (old, old))
+	remove_orphans(tmp_path, {used})
+	assert sorted(p.name for p in tmp_path.iterdir()) == sorted([used, fresh])

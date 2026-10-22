@@ -1,0 +1,151 @@
+/* Design tokens. Every spacing, type, color and shadow value in the app comes from here.
+   The theme is resolved to data-theme="light|dark" on <html> by the inline script in index.html. */
+
+:root {
+	--sp-1: 4px;
+	--sp-2: 8px;
+	--sp-3: 12px;
+	--sp-4: 16px;
+	--sp-5: 24px;
+	--sp-6: 32px;
+	--sp-7: 48px;
+	--sp-8: 64px;
+
+	--fs-12: 12px;
+	--fs-14: 14px;
+	--fs-16: 16px;
+	--fs-18: 18px;
+	--fs-20: 20px;
+	--fs-24: 24px;
+	--fs-30: 30px;
+
+	--r-sm: 6px;
+	--r: 8px;
+	--r-lg: 12px;
+	--r-full: 999px;
+
+	--font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Ubuntu, sans-serif;
+	--font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Roboto, Ubuntu, sans-serif;
+	--mono: "Cascadia Mono", "Cascadia Code", "SF Mono", ui-monospace, Consolas, "Liberation Mono", monospace;
+
+	--sidebar-w: 264px;
+	--content-max: 1180px;
+	--ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+
+	/* Accent: hand-built teal ramp (hue drifts toward cyan as it darkens). */
+	--teal-50: hsl(176 70% 96%);
+	--teal-100: hsl(176 66% 91%);
+	--teal-200: hsl(177 58% 81%);
+	--teal-300: hsl(178 52% 66%);
+	--teal-400: hsl(179 54% 48%);
+	--teal-500: hsl(180 70% 36%);
+	--teal-600: hsl(181 80% 28%);
+	--teal-700: hsl(182 82% 23%);
+	--teal-800: hsl(184 80% 18%);
+	--teal-900: hsl(186 76% 13%);
+}
+
+:root,
+:root[data-theme="light"] {
+	color-scheme: light;
+	--bg: hsl(200 22% 97%);
+	--surface: hsl(0 0% 100%);
+	--surface-2: hsl(200 20% 96%);
+	--surface-3: hsl(200 17% 92.5%);
+	--border: hsl(202 15% 88%);
+	--border-strong: hsl(204 12% 77%);
+	--text: hsl(208 32% 12%);
+	--text-2: hsl(206 14% 34%);
+	--text-3: hsl(206 11% 46%);
+
+	--accent: var(--teal-600);
+	--accent-hover: var(--teal-700);
+	--accent-ink: hsl(0 0% 100%);
+	--accent-text: var(--teal-700);
+	--accent-soft: var(--teal-50);
+	--accent-soft-2: var(--teal-100);
+	--accent-line: var(--teal-200);
+	--focus-ring: 0 0 0 3px hsl(180 70% 40% / 0.32);
+
+	--good: hsl(145 63% 30%);
+	--good-soft: hsl(140 55% 94%);
+	--good-line: hsl(142 45% 78%);
+	--warn: hsl(32 92% 34%);
+	--warn-soft: hsl(43 100% 92%);
+	--warn-line: hsl(40 85% 72%);
+	--bad: hsl(356 68% 45%);
+	--bad-hover: hsl(356 70% 39%);
+	--bad-soft: hsl(355 90% 96%);
+	--bad-line: hsl(356 75% 84%);
+
+	--series-1: hsl(181 80% 30%);
+	--series-2: hsl(28 90% 50%);
+	--grid: hsl(202 15% 92%);
+
+	--code-bg: hsl(205 24% 97.5%);
+	--code-key: hsl(200 70% 30%);
+	--code-string: hsl(150 60% 27%);
+	--code-number: hsl(26 85% 38%);
+	--code-literal: hsl(276 48% 44%);
+	--code-punct: hsl(206 12% 52%);
+
+	--shadow-color: 208 40% 18%;
+	--sh-1: 0 1px 2px hsl(var(--shadow-color) / 0.06);
+	--sh-2: 0 1px 3px hsl(var(--shadow-color) / 0.08), 0 1px 2px hsl(var(--shadow-color) / 0.04);
+	--sh-3: 0 6px 16px -4px hsl(var(--shadow-color) / 0.12), 0 2px 4px -2px hsl(var(--shadow-color) / 0.06);
+	--sh-4: 0 18px 40px -10px hsl(var(--shadow-color) / 0.22), 0 6px 12px -6px hsl(var(--shadow-color) / 0.08);
+	--sh-5: 0 28px 64px -16px hsl(var(--shadow-color) / 0.32), 0 8px 16px -8px hsl(var(--shadow-color) / 0.1);
+	--backdrop: hsl(208 30% 12% / 0.42);
+}
+
+:root[data-theme="dark"] {
+	color-scheme: dark;
+	--bg: hsl(206 24% 7%);
+	--surface: hsl(206 20% 10%);
+	--surface-2: hsl(206 17% 13%);
+	--surface-3: hsl(206 15% 17%);
+	--border: hsl(206 13% 20%);
+	--border-strong: hsl(206 11% 30%);
+	--text: hsl(200 20% 93%);
+	--text-2: hsl(204 12% 72%);
+	--text-3: hsl(205 9% 57%);
+
+	--accent: hsl(177 58% 48%);
+	--accent-hover: hsl(176 60% 56%);
+	--accent-ink: hsl(190 60% 7%);
+	--accent-text: hsl(176 60% 62%);
+	--accent-soft: hsl(181 45% 12%);
+	--accent-soft-2: hsl(181 42% 16%);
+	--accent-line: hsl(180 42% 27%);
+	--focus-ring: 0 0 0 3px hsl(177 60% 50% / 0.35);
+
+	--good: hsl(142 55% 58%);
+	--good-soft: hsl(145 40% 12%);
+	--good-line: hsl(145 35% 25%);
+	--warn: hsl(40 90% 62%);
+	--warn-soft: hsl(38 50% 12%);
+	--warn-line: hsl(38 45% 28%);
+	--bad: hsl(356 80% 68%);
+	--bad-hover: hsl(356 85% 74%);
+	--bad-soft: hsl(356 40% 13%);
+	--bad-line: hsl(356 40% 30%);
+
+	--series-1: hsl(177 58% 52%);
+	--series-2: hsl(32 95% 60%);
+	--grid: hsl(206 14% 16%);
+
+	--code-bg: hsl(206 22% 8.5%);
+	--code-key: hsl(195 75% 70%);
+	--code-string: hsl(140 50% 66%);
+	--code-number: hsl(30 90% 68%);
+	--code-literal: hsl(276 70% 76%);
+	--code-punct: hsl(206 10% 55%);
+
+	--shadow-color: 210 50% 2%;
+	--sh-1: 0 1px 2px hsl(var(--shadow-color) / 0.4);
+	--sh-2: 0 1px 3px hsl(var(--shadow-color) / 0.5), 0 1px 2px hsl(var(--shadow-color) / 0.3);
+	--sh-3: 0 8px 20px -4px hsl(var(--shadow-color) / 0.6), 0 2px 4px -2px hsl(var(--shadow-color) / 0.4);
+	--sh-4: 0 20px 44px -10px hsl(var(--shadow-color) / 0.7), 0 6px 12px -6px hsl(var(--shadow-color) / 0.5);
+	--sh-5: 0 30px 70px -16px hsl(var(--shadow-color) / 0.8), 0 8px 16px -8px hsl(var(--shadow-color) / 0.5);
+	--backdrop: hsl(210 40% 2% / 0.66);
+}

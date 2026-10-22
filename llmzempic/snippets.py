@@ -2,6 +2,7 @@
 
 Every client asks the server to constrain decoding to the JSON Schema (Ollama `format`,
 llama-server `response_format`), so responses always parse; the fine-tune makes them correct.
+Clients for image models take an image file (sent base64-encoded) plus optional text.
 """
 
 import json
@@ -22,9 +23,23 @@ def snake(name):
 	return ident if ident[:1].isalpha() else f"model_{ident}"
 
 
-def php_client(name, schema):
+def php_client(name, schema, vision=False):
 	fn = snake(name)
 	const = fn.upper() + "_SCHEMA"
+	if vision:
+		params = "string $imagePath, string $text = ''"
+		read = (
+			"\t$image = file_get_contents($imagePath);\n"
+			"\tif ($image === false) {\n"
+			"\t\tthrow new RuntimeException(\"Could not read $imagePath\");\n"
+			"\t}\n"
+		)
+		message = "['role' => 'user', 'content' => $text, 'images' => [base64_encode($image)]]"
+		example = f"{fn}('photo.jpg')"
+	else:
+		params, read = "string $input", ""
+		message = "['role' => 'user', 'content' => $input]"
+		example = f"{fn}('Text to analyze')"
 	return f"""<?php
 // Calls the fine-tuned "{name}" model through Ollama (https://ollama.com).
 // One-time setup, from the export folder: ollama create {name} -f Modelfile
@@ -35,11 +50,11 @@ const {const} = <<<'JSON'
 {json.dumps(schema, indent=4, ensure_ascii=False)}
 JSON;
 
-function {fn}(string $input, string $host = 'http://localhost:11434'): array
+function {fn}({params}, string $host = 'http://localhost:11434'): array
 {{
-	$payload = [
+{read}	$payload = [
 		'model' => '{name}',
-		'messages' => [['role' => 'user', 'content' => $input]],
+		'messages' => [{message}],
 		'format' => json_decode({const}, true),
 		'stream' => false,
 		'options' => ['temperature' => 0],
@@ -65,7 +80,7 @@ function {fn}(string $input, string $host = 'http://localhost:11434'): array
 }}
 
 // Example:
-// $result = {fn}('Text to analyze');
+// $result = {example};
 // echo $result[array_key_first($result)];
 """
 
@@ -116,8 +131,16 @@ def _cs_class(schema, name, classes):
 	return name
 
 
-def csharp_client(name, schema):
+def csharp_client(name, schema, vision=False):
 	cls = pascal(name)
+	if vision:
+		params = 'string imagePath, string input = "", CancellationToken cancellationToken = default'
+		read = "var image = Convert.ToBase64String(await File.ReadAllBytesAsync(imagePath, cancellationToken));\n\t\t"
+		message = '["role"] = "user", ["content"] = input, ["images"] = new JsonArray(image)'
+	else:
+		params = "string input, CancellationToken cancellationToken = default"
+		read = ""
+		message = '["role"] = "user", ["content"] = input'
 	classes = {}
 	result_type = "JsonElement"
 	if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
@@ -134,6 +157,7 @@ def csharp_client(name, schema):
 // system_prompt.txt and response_format = {{ type: "json_schema", json_schema: {{ schema }} }}.
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
@@ -158,12 +182,12 @@ public sealed class {cls}Client
 		_model = model;
 	}}
 
-	public async Task<{result_type}> RunAsync(string input, CancellationToken cancellationToken = default)
+	public async Task<{result_type}> RunAsync({params})
 	{{
-		var payload = new JsonObject
+		{read}var payload = new JsonObject
 		{{
 			["model"] = _model,
-			["messages"] = new JsonArray(new JsonObject {{ ["role"] = "user", ["content"] = input }}),
+			["messages"] = new JsonArray(new JsonObject {{ {message} }}),
 			["format"] = JsonNode.Parse(Schema),
 			["stream"] = false,
 			["options"] = new JsonObject {{ ["temperature"] = 0 }},
@@ -181,19 +205,29 @@ public sealed class {cls}Client
 """
 
 
-def python_client(name, schema):
+def python_client(name, schema, vision=False):
 	fn = snake(name)
+	if vision:
+		imports = "import base64\nimport json\nimport urllib.request"
+		params = 'image_path, text=""'
+		read = '\twith open(image_path, "rb") as f:\n\t\timage = base64.b64encode(f.read()).decode("ascii")\n'
+		message = '{"role": "user", "content": text, "images": [image]}'
+		example = f'{fn}("photo.jpg")'
+	else:
+		imports = "import json\nimport urllib.request"
+		params, read = "text", ""
+		message = '{"role": "user", "content": text}'
+		example = f'{fn}("Text to analyze")'
 	return f'''"""Calls the fine-tuned "{name}" model through Ollama. Setup: ollama create {name} -f Modelfile"""
-import json
-import urllib.request
+{imports}
 
 SCHEMA = {pprint.pformat(schema, indent=1, width=100, sort_dicts=False)}
 
 
-def {fn}(text, host="http://localhost:11434"):
-	payload = {{
+def {fn}({params}, host="http://localhost:11434"):
+{read}	payload = {{
 		"model": "{name}",
-		"messages": [{{"role": "user", "content": text}}],
+		"messages": [{message}],
 		"format": SCHEMA,
 		"stream": False,
 		"options": {{"temperature": 0}},
@@ -209,36 +243,53 @@ def {fn}(text, host="http://localhost:11434"):
 
 
 if __name__ == "__main__":
-	print({fn}("Text to analyze"))
+	print({example})
 '''
 
 
-def llama_server_request(system_prompt, schema, example_input="Text to analyze"):
+IMAGE_PLACEHOLDER = "data:image/jpeg;base64,PUT_BASE64_IMAGE_HERE"
+
+
+def llama_server_request(system_prompt, schema, example_input="Text to analyze", vision=False):
+	content = example_input
+	if vision:
+		# OpenAI-style content parts; the text part is optional, like in training.
+		content = [{"type": "image_url", "image_url": {"url": IMAGE_PLACEHOLDER}}]
+		if example_input:
+			content.append({"type": "text", "text": example_input})
 	return {
 		"messages": [
 			{"role": "system", "content": system_prompt},
-			{"role": "user", "content": example_input},
+			{"role": "user", "content": content},
 		],
 		"temperature": 0,
 		"response_format": {"type": "json_schema", "json_schema": {"name": "output", "schema": schema}},
 	}
 
 
-def llama_server_usage(gguf_file, ctx):
-	return (
+def llama_server_usage(gguf_file, ctx, mmproj_file=None, image_tokens=None):
+	images = ""
+	if mmproj_file:
+		images = f" --mmproj {mmproj_file}" + (f" --image-max-tokens {image_tokens}" if image_tokens else "")
+	usage = (
 		f"# Serve the model with llama.cpp (https://github.com/ggml-org/llama.cpp/releases)\n"
-		f"llama-server -m {gguf_file or 'model.gguf'} --port 8080 -c {ctx}\n\n"
+		f"llama-server -m {gguf_file or 'model.gguf'}{images} --port 8080 -c {ctx}\n\n"
 		"# Call it (OpenAI-compatible). request.json includes the system prompt the model was trained with.\n"
-		"curl http://localhost:8080/v1/chat/completions -H \"Content-Type: application/json\" -d @llama-server-request.json\n"
 	)
+	if mmproj_file:
+		usage += f"# Replace {IMAGE_PLACEHOLDER.split(',')[1]} with the image file's base64 (data:image/png;base64,... for PNG).\n"
+	return usage + "curl http://localhost:8080/v1/chat/completions -H \"Content-Type: application/json\" -d @llama-server-request.json\n"
 
 
-def all_snippets(name, schema, system_prompt, gguf_file=None, ctx=4096):
+def all_snippets(name, schema, system_prompt, gguf_file=None, ctx=4096, vision=False, mmproj_file=None, image_tokens=None):
+	example = "" if vision else "Text to analyze"
+	if vision and gguf_file and not mmproj_file:
+		mmproj_file = f"mmproj-{name}-f16.gguf"
 	return {
-		"php": php_client(name, schema),
-		"csharp": csharp_client(name, schema),
-		"python": python_client(name, schema),
-		"llama_server": llama_server_usage(gguf_file, ctx)
+		"php": php_client(name, schema, vision),
+		"csharp": csharp_client(name, schema, vision),
+		"python": python_client(name, schema, vision),
+		"llama_server": llama_server_usage(gguf_file, ctx, mmproj_file if vision else None, image_tokens)
 		+ "\n# llama-server-request.json\n"
-		+ json.dumps(llama_server_request(system_prompt, schema), indent=2, ensure_ascii=False),
+		+ json.dumps(llama_server_request(system_prompt, schema, example, vision), indent=2, ensure_ascii=False),
 	}

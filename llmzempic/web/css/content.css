@@ -1,0 +1,76 @@
+/* ---------- tables ---------- */
+
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r); }
+
+table {
+	width: 100%;
+	border-collapse: collapse;
+	background: var(--surface);
+}
+
+th,
+td {
+	padding: 10px 12px;
+	border-bottom: 1px solid var(--border);
+	text-align: left;
+	vertical-align: top;
+}
+
+th {
+	background: var(--surface-2);
+	color: var(--text-2);
+	font-size: var(--fs-12);
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+tbody tr:last-child td { border-bottom: 0; }
+td.num,
+th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---------- code ---------- */
+
+.code-block {
+	margin: 0;
+	padding: var(--sp-4);
+	overflow: auto;
+	border: 1px solid var(--border);
+	border-radius: var(--r);
+	background: var(--code-bg);
+	color: var(--text);
+	font: 13px / 1.6 var(--mono);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.code-block.scroll { max-height: 420px; }
+.code-block.nowrap { white-space: pre; word-break: normal; }
+
+.j-key { color: var(--code-key); }
+.j-str { color: var(--code-string); }
+.j-num { color: var(--code-number); }
+.j-lit { color: var(--code-literal); }
+.j-punct { color: var(--code-punct); }
+
+/* ---------- tabs (inline, for code snippets and similar) ---------- */
+
+.tabs {
+	display: flex;
+	gap: var(--sp-1);
+	border-bottom: 1px solid var(--border);
+}
+
+.tabs button {
+	margin-bottom: -1px;
+	padding: 8px 12px;
+	border: 0;
+	border-bottom: 2px solid transparent;
+	background: none;
+	color: var(--text-2);
+	font: 600 13px var(--font);
+	cursor: pointer;
+}
+
+.tabs button:hover { color: var(--text); }
+.tabs button[aria-selected="true"] { border-bottom-color: var(--accent); color: var(--text); }
+.tabs button:focus-visible { outline: none; box-shadow: var(--focus-ring); border-radius: var(--r-sm); }

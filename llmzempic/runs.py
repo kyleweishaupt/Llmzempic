@@ -7,6 +7,7 @@ import time
 from . import __version__
 from .dataset import split_examples
 from .fileio import read_json, write_json, write_jsonl
+from .images import image_path, link_images
 from .prompts import build_system_prompt
 from .schema_tools import check_schema, validate_output
 from .workspace import catalog_entry, slugify
@@ -18,15 +19,24 @@ class RunError(Exception):
 	pass
 
 
-def validate_examples(examples, schema):
+def _input_errors(example, input_kind, images_dir):
+	if input_kind != "image":
+		return [] if str(example.get("input", "")).strip() else ["Input is empty"]
+	if not example.get("image"):
+		return ["No image"]
+	try:
+		image_path(images_dir, example["image"])
+	except KeyError:
+		return ["Image file is missing"]
+	return []
+
+
+def validate_examples(examples, schema, input_kind="text", images_dir=None):
 	invalid = []
 	if check_schema(schema):
 		return invalid
 	for example in examples:
-		errors = []
-		if not str(example.get("input", "")).strip():
-			errors.append("Input is empty")
-		errors += validate_output(example.get("output"), schema)
+		errors = _input_errors(example, input_kind, images_dir) + validate_output(example.get("output"), schema)
 		if errors:
 			invalid.append({"id": example.get("id"), "errors": errors})
 	return invalid
@@ -45,24 +55,30 @@ def create_run(project):
 		raise RunError(problems[0])
 	if not str(config.get("base_model") or "").strip():
 		raise RunError("Choose a base model first.")
+	input_kind = config.get("input_kind", "text")
+	entry = catalog_entry(config["base_model"].strip())
+	if entry and input_kind == "image" and not entry.get("vision"):
+		raise RunError(f"{entry['name']} can't read images. Pick a vision model on the Model tab.")
+	if entry and input_kind != "image" and entry.get("vision"):
+		raise RunError(f"{entry['name']} is a vision model. Pick a text model on the Model tab.")
 	examples = project.load_examples()
 	if len(examples) < 2:
 		raise RunError("Add at least 2 examples (20 or more is recommended).")
-	invalid = validate_examples(examples, schema)
+	invalid = validate_examples(examples, schema, input_kind, project.images_dir)
 	if invalid:
-		raise RunError(f"{len(invalid)} example(s) don't match the output schema. Fix them on the Examples tab.")
+		raise RunError(f"{len(invalid)} example(s) have problems. Fix them on the Examples tab.")
 
 	training = config["training"]
 	train_rows, eval_rows, split = split_examples(
 		examples, schema, float(training.get("eval_fraction") or 0), int(training.get("seed") or 42)
 	)
 
-	entry = catalog_entry(config["base_model"])
 	spec = {
 		"project_id": project.id,
 		"project_name": config.get("name") or project.id,
 		"base_model": config["base_model"].strip(),
 		"params_b": entry["params_b"] if entry else None,
+		"input_kind": input_kind,
 		"instructions": config.get("instructions", ""),
 		"schema": schema,
 		"system_prompt": build_system_prompt(
@@ -76,6 +92,8 @@ def create_run(project):
 		"app_version": __version__,
 	}
 	run_dir = project.new_run_dir()
+	if input_kind == "image":
+		link_images([e["image"] for e in examples], project.images_dir, run_dir / "images")
 	write_json(run_dir / "run.json", spec)
 	write_jsonl(run_dir / "train.jsonl", train_rows)
 	write_jsonl(run_dir / "eval.jsonl", eval_rows)
@@ -112,25 +130,39 @@ MAX_PREDICT_INPUTS = 10
 MAX_PREDICT_CHARS = 200_000
 
 
-def prepare_prediction(run_dir, payload):
+def prepare_prediction(run_dir, payload, source_images=None):
+	"""Validate a Try-it request. Image names refer to source_images (a project's images folder),
+	or, without it, to images already in the run's images folder."""
 	status = read_json(run_dir / "status.json", {}) or {}
 	if status.get("state") != "completed" or not (run_dir / "adapter").exists():
 		raise RunError("Only completed training runs can be tried.")
+	vision = (read_json(run_dir / "run.json", {}) or {}).get("input_kind") == "image"
 	inputs = payload.get("inputs")
 	if not isinstance(inputs, list) or not inputs:
 		raise RunError("Enter an input to try.")
 	if len(inputs) > MAX_PREDICT_INPUTS:
 		raise RunError(f"Try at most {MAX_PREDICT_INPUTS} inputs at a time.")
 	inputs = [str(x or "") for x in inputs]
-	if any(not x.strip() for x in inputs):
+	images = payload.get("images") if vision else None
+	if vision:
+		if not isinstance(images, list) or len(images) != len(inputs) or not all(isinstance(x, str) and x for x in images):
+			raise RunError("Add an image to try.")
+		try:
+			for name in images:
+				image_path(source_images or run_dir / "images", name)
+		except KeyError:
+			raise RunError("That image is no longer available. Add it again.")
+	elif any(not x.strip() for x in inputs):
 		raise RunError("Enter an input to try.")
 	if any(len(x) > MAX_PREDICT_CHARS for x in inputs):
 		raise RunError("That input is too long to try here.")
+	if images and source_images:
+		link_images(images, source_images, run_dir / "images")
 	predict_dir = run_dir / "predict"
 	predict_dir.mkdir(exist_ok=True)
 	for stale in ("result.json", "predict.log"):
 		(predict_dir / stale).unlink(missing_ok=True)
-	write_json(predict_dir / "request.json", {"inputs": inputs})
+	write_json(predict_dir / "request.json", {"inputs": inputs, "images": images} if vision else {"inputs": inputs})
 	write_json(predict_dir / "status.json", {"state": "queued", "stage": "Waiting to start", "updated": time.time()})
 	return predict_dir
 
@@ -152,6 +184,7 @@ def run_summary(run_dir):
 		"train_count": spec.get("train_count"),
 		"eval_count": spec.get("eval_count"),
 		"split": spec.get("split"),
+		"input_kind": spec.get("input_kind", "text"),
 		"model_name": model_name(spec),
 		"status": status,
 		"metrics": _summary_metrics(read_json(run_dir / "eval.json", None)),

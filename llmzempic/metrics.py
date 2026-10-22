@@ -29,7 +29,7 @@ def parse_generated(text):
 
 
 def score_predictions(rows, generations, schema):
-	"""rows: [{"input", "output"}]; generations: model texts in the same order."""
+	"""rows: [{"input", "output", "image"?}]; generations: model texts in the same order."""
 	items = []
 	field_hits = {}
 	for row, text in zip(rows, generations):
@@ -44,6 +44,7 @@ def score_predictions(rows, generations, schema):
 				field_hits[key] = (total + 1, good + (1 if hit else 0))
 		items.append({
 			"input": row["input"],
+			"image": row.get("image"),
 			"expected": expected,
 			"generated": text,
 			"json_valid": ok,

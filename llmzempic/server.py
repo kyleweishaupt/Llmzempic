@@ -15,6 +15,7 @@ from . import __version__, hardware
 from .data import parse_examples
 from .dataset import dataset_stats
 from .fileio import read_json, tail_text
+from .image_api import image_router
 from .jobs import JobBusy, JobManager, job_paths, mark_interrupted
 from .metrics import label_breakdown
 from .prompts import build_system_prompt
@@ -27,6 +28,15 @@ from .snippets import all_snippets
 from .workspace import PRESETS, Workspace, load_catalog
 
 WEB_DIR = Path(__file__).with_name("web")
+
+
+class WebFiles(StaticFiles):
+	"""Revalidate on every load (a cheap 304 on localhost) so an updated UI never mixes with stale cached modules."""
+
+	def file_response(self, *args, **kwargs):
+		response = super().file_response(*args, **kwargs)
+		response.headers["Cache-Control"] = "no-cache"
+		return response
 
 
 class HardwareCache:
@@ -94,7 +104,7 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		examples = project.load_examples()
 		return {
 			"examples": examples,
-			"invalid": validate_examples(examples, config["schema"]),
+			"invalid": validate_examples(examples, config["schema"], config.get("input_kind", "text"), project.images_dir),
 			"stats": dataset_stats(examples, config["schema"]),
 			"warnings": warnings or [],
 		}
@@ -141,6 +151,7 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 				"id": project.id,
 				"name": config.get("name") or project.id,
 				"base_model": config.get("base_model"),
+				"input_kind": config.get("input_kind", "text"),
 				"updated": config.get("updated") or config.get("created"),
 				"last_run": last,
 			})
@@ -225,6 +236,9 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		if not hw["can_train"]:
 			missing = ", ".join(hw["missing_train_packages"]) or "PyTorch"
 			raise HTTPException(400, f"Training libraries are missing ({missing}). Run the setup script, then restart.")
+		if project.load_config().get("input_kind") == "image" and not hw["can_train_images"]:
+			missing = ", ".join(hw["missing_image_packages"])
+			raise HTTPException(400, f"Image projects need {missing}. Run the setup script, then restart.")
 		try:
 			run_dir = create_run(project)
 		except RunError as e:
@@ -292,14 +306,15 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 
 	@app.post("/api/projects/{project_id}/runs/{run_id}/predict")
 	def predict_run(project_id: str, run_id: str, payload: dict = Body(...)):
-		run_dir = run_or_404(project_or_404(project_id), run_id)
+		project = project_or_404(project_id)
+		run_dir = run_or_404(project, run_id)
 		if jobs.current():
 			raise HTTPException(409, "Another job is running. Wait for it to finish or stop it.")
 		hw = hw_cache.get()
 		if not hw["can_train"]:
 			raise HTTPException(400, "Trying a model needs the training libraries (PyTorch, transformers, peft).")
 		try:
-			prepare_prediction(run_dir, payload)
+			prepare_prediction(run_dir, payload, project.images_dir)
 			jobs.start("predict", run_dir, job_env())
 		except RunError as e:
 			raise HTTPException(400, str(e))
@@ -317,7 +332,10 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		manifest = read_json(run_dir / "export" / "llmzempic.json", {}) or {}
 		return {
 			"name": name,
-			"snippets": all_snippets(name, spec["schema"], spec["system_prompt"], export_status.get("gguf"), manifest.get("context_size", 4096)),
+			"snippets": all_snippets(
+				name, spec["schema"], spec["system_prompt"], export_status.get("gguf"), manifest.get("context_size", 4096),
+				vision=spec.get("input_kind") == "image", mmproj_file=export_status.get("mmproj"), image_tokens=manifest.get("image_max_tokens"),
+			),
 		}
 
 	@app.post("/api/projects/{project_id}/runs/{run_id}/open")
@@ -335,5 +353,6 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 			raise HTTPException(500, f"Could not open the folder: {e}")
 		return {"path": str(target)}
 
-	app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
+	app.include_router(image_router(project_or_404, run_or_404))
+	app.mount("/", WebFiles(directory=str(WEB_DIR), html=True), name="web")
 	return app

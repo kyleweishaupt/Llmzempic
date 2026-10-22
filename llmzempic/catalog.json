@@ -124,6 +124,43 @@
 			"tier": "Smartest",
 			"license": "Apache-2.0",
 			"notes": "Most capable option. Needs 16 GB+ VRAM with 4-bit training."
+		},
+		{
+			"id": "HuggingFaceTB/SmolVLM-256M-Instruct",
+			"name": "SmolVLM 256M",
+			"params_b": 0.256,
+			"tier": "Tiny",
+			"license": "Apache-2.0",
+			"vision": true,
+			"notes": "Pipeline smoke tests and very simple yes/no image checks. Trains on CPU."
+		},
+		{
+			"id": "HuggingFaceTB/SmolVLM-500M-Instruct",
+			"name": "SmolVLM 500M",
+			"params_b": 0.507,
+			"tier": "Fast",
+			"license": "Apache-2.0",
+			"vision": true,
+			"notes": "Fast image classifier that runs on any CPU after export."
+		},
+		{
+			"id": "Qwen/Qwen3-VL-2B-Instruct",
+			"name": "Qwen3-VL 2B Instruct",
+			"params_b": 2.13,
+			"tier": "Balanced",
+			"license": "Apache-2.0",
+			"vision": true,
+			"recommended": true,
+			"notes": "Best default for images: strong general image understanding; trains in 4-bit on 8 GB GPUs."
+		},
+		{
+			"id": "Qwen/Qwen3-VL-4B-Instruct",
+			"name": "Qwen3-VL 4B Instruct",
+			"params_b": 4.44,
+			"tier": "Smart",
+			"license": "Apache-2.0",
+			"vision": true,
+			"notes": "Sharper on cluttered photos and small details. Needs a GPU (4-bit with 8 GB+ VRAM)."
 		}
 	]
 }

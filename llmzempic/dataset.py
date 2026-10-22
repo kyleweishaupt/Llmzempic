@@ -48,17 +48,19 @@ def _field_counts(examples, name, kind, values):
 	return {"field": name, "kind": kind, "values": [{"value": v, "count": counts[value_key(v)]} for v in values]}
 
 
-def normalize_input(text):
-	"""Inputs that differ only in whitespace count as the same input."""
-	return " ".join(str(text or "").split())
+def input_key(example):
+	"""Examples with the same image and text (ignoring whitespace) count as the same input."""
+	text = " ".join(str(example.get("input") or "").split())
+	image = example.get("image")
+	return f"{image}\n{text}" if image else text
 
 
 def _duplicates(examples):
 	groups = {}
 	for example in examples:
-		text = normalize_input(example.get("input"))
-		if text:
-			groups.setdefault(text, []).append(example)
+		key = input_key(example)
+		if key:
+			groups.setdefault(key, []).append(example)
 	return [
 		{
 			"ids": [e.get("id") for e in group],
@@ -86,7 +88,7 @@ def split_examples(examples, schema, fraction, seed):
 	rng = random.Random(seed)
 	groups = {}
 	for i, example in enumerate(examples):
-		groups.setdefault(normalize_input(example.get("input")) or ("", i), []).append(example)
+		groups.setdefault(input_key(example) or ("", i), []).append(example)
 	field = None
 	if not check_schema(schema):
 		field = next((name for name, kind, _ in label_fields(schema) if kind != "tags"), None)

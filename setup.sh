@@ -17,7 +17,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 INDEX="${TORCH_INDEX_URL:-$DEFAULT_INDEX}"
 echo "Installing PyTorch from $INDEX"
-"$PY" -m pip install torch --index-url "$INDEX"
+# torchvision comes from the same index so its build matches torch (image models need it).
+"$PY" -m pip install torch torchvision --index-url "$INDEX"
 "$PY" -m pip install -e ".[$EXTRAS]"
 if [ "${WITH_UNSLOTH:-0}" = "1" ]; then
 	"$PY" -m pip install unsloth

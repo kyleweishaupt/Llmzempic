@@ -46,8 +46,14 @@ def cmd_try(args):
 	from .runs import prepare_prediction
 
 	run_dir = Path(args.run).expanduser().resolve()
+	payload = {"inputs": args.inputs}
+	if args.image:
+		from .images import save_image
+		names = [save_image(run_dir / "images", Path(p).expanduser().read_bytes()) for p in args.image]
+		# Text is optional for image runs; pair each image with its text, or none.
+		payload = {"inputs": (args.inputs + [""] * len(names))[:len(names)], "images": names}
 	# Validate the run and inputs before loading PyTorch.
-	predict_dir = prepare_prediction(run_dir, {"inputs": args.inputs})
+	predict_dir = prepare_prediction(run_dir, payload)
 	from .predictor import run_prediction
 	run_prediction(run_dir, StatusFile(predict_dir / "status.json"))
 	print(json.dumps(read_json(predict_dir / "result.json"), indent=2, ensure_ascii=False))
@@ -98,7 +104,8 @@ def main(argv=None):
 
 	try_ = sub.add_parser("try", help="Answer inputs with a trained run (before exporting it)")
 	try_.add_argument("run", help="Run folder (…/projects/<id>/runs/<run>)")
-	try_.add_argument("inputs", nargs="+", help="One or more input texts")
+	try_.add_argument("inputs", nargs="*", help="One or more input texts (optional with --image)")
+	try_.add_argument("--image", action="append", metavar="PATH", help="Image file to answer (image runs; repeatable)")
 	try_.set_defaults(func=cmd_try)
 
 	doctor = sub.add_parser("doctor", help="Show detected hardware and libraries")
@@ -113,7 +120,7 @@ def main(argv=None):
 	except KeyboardInterrupt:
 		return 130
 	except Exception as e:  # surface run/setup errors without a traceback wall
-		if type(e).__name__ in ("RunError", "KeyError"):
+		if type(e).__name__ in ("RunError", "KeyError", "ImageError", "FileNotFoundError"):
 			print(f"error: {e}", file=sys.stderr)
 			return 1
 		raise

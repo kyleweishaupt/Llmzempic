@@ -146,3 +146,14 @@ def test_split_edge_cases():
 	for seed in range(20):
 		assert len(split_examples(big, CLASSIFY, 0.1, seed)[1]) == 5
 
+
+
+def test_image_examples_are_the_same_input_only_with_the_same_image_and_text():
+	examples = [
+		{"id": "1", "input": "", "image": "a.jpg", "output": {"label": "billing"}},
+		{"id": "2", "input": " ", "image": "a.jpg", "output": {"label": "technical"}},
+		{"id": "3", "input": "", "image": "b.jpg", "output": {"label": "billing"}},
+		{"id": "4", "input": "close up", "image": "a.jpg", "output": {"label": "billing"}},
+	]
+	assert dataset_stats(examples, CLASSIFY)["duplicates"] == [{"ids": ["1", "2"], "conflict": True}]
+	assert split_examples(examples, CLASSIFY, 0.5, 1)[2]["groups"] == 3
