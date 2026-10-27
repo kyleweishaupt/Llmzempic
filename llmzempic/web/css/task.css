@@ -21,6 +21,19 @@
 .prompt-card[open] > summary { border-bottom: 1px solid var(--border); }
 .prompt-card .code-block { max-height: 320px; }
 
+/* ---------- decision questions ---------- */
+
+.question-list { display: grid; gap: var(--sp-2); margin: 0; padding: 0; list-style: none; }
+.question {
+	display: grid;
+	gap: var(--sp-1);
+	min-width: 0;
+	padding: var(--sp-3);
+	border: 1px solid var(--border);
+	border-radius: var(--r);
+}
+.question .spread { flex-wrap: wrap; gap: var(--sp-2); }
+
 /* ---------- input kind cards ---------- */
 
 .choice-cards {

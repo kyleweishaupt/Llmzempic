@@ -277,3 +277,21 @@
 	.try-inputs { grid-template-columns: minmax(0, 1fr); }
 	.try-result { flex-direction: column; }
 }
+
+/* ---------- decision answers ---------- */
+
+.decision-answers { display: grid; gap: var(--sp-3); }
+.decision { display: grid; gap: var(--sp-1); min-width: 0; }
+.prob-row {
+	display: grid;
+	grid-template-columns: minmax(0, 10rem) minmax(60px, 1fr) 3.5rem;
+	align-items: center;
+	gap: var(--sp-2);
+	font-size: var(--fs-14);
+}
+.prob-row .num { text-align: right; }
+.prob-row.top .prob-label { font-weight: 600; }
+.decision-table td.num, .decision-table th.num { text-align: right; }
+.decision-table .good-text { color: var(--good); }
+.decision-table .warn-text { color: var(--warn); }
+.decision-table .bad-text { color: var(--bad); }

@@ -30,6 +30,7 @@ const TRAINING_FIELDS = [
 	{ key: "quantization", label: "Quantization", options: [["auto", "Auto"], ["4bit", "4-bit QLoRA"], ["none", "None (16-bit)"]] },
 	{ key: "accelerator", label: "Accelerator", options: [["auto", "Auto (Unsloth if installed)"], ["unsloth", "Unsloth"], ["off", "Standard PEFT"]], help: "Unsloth is used for text models only." },
 	{ key: "seed", label: "Random seed", step: 1, min: 0 },
+	{ key: "kl_weight", label: "KL anchor weight", step: 0.05, min: 0, decisions: true, help: "Keeps the model's general language close to the base model while it learns to decide. 0 turns it off." },
 ];
 
 function selectModel(id) {
@@ -95,7 +96,7 @@ function presetSection() {
 	const t = S.config.training;
 	const active = Object.entries(S.catalog.presets).find(([, values]) => Object.entries(values).every(([k, v]) => Number(t[k]) === v));
 	const activeName = active ? active[0] : "custom";
-	const controls = TRAINING_FIELDS.map((f) => {
+	const controls = TRAINING_FIELDS.filter((f) => !f.decisions || S.config.answer_mode === "decisions").map((f) => {
 		const value = t[f.key];
 		const control = f.options
 			? h("select", {}, f.options.map(([v, label]) => h("option", { value: v, selected: v === value }, label)))

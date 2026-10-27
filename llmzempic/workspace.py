@@ -33,6 +33,8 @@ DEFAULT_TRAINING = {
 	"quantization": "auto",
 	"accelerator": "auto",
 	"seed": 42,
+	# Decision models only: weight of the KL anchor that keeps the tuned model's language close to the base.
+	"kl_weight": 0.1,
 }
 
 PRESETS = {
@@ -68,6 +70,7 @@ def default_config(name="", template_id="classification"):
 		"instructions": template["instructions"],
 		"schema": copy.deepcopy(template["schema"]),
 		"include_schema_in_prompt": True,
+		"answer_mode": "json",
 		"training": dict(DEFAULT_TRAINING),
 	}
 

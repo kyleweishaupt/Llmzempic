@@ -13,10 +13,11 @@ from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, hardware
+from . import __version__, decisions, hardware
 from .checks import Checker
 from .data import InvalidExample
 from .dataset_api import dataset_router
+from .decision_snippets import all_decision_snippets
 from .example_api import example_router
 from .package_api import package_router
 from .fileio import read_json, tail_text
@@ -120,14 +121,25 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		config = project.load_config()
 		names = {m["id"]: m["name"] for m in ws.library.list()}
 		missing = sorted(i for i in referenced_ids(config["schema"]) if i not in names)
-		return {
-			"id": project.id,
-			"config": config,
-			"schema_errors": check_schema(config["schema"]) + [f'Data set "{i}" no longer exists.' for i in missing],
-			"system_prompt": build_system_prompt(
+		errors = check_schema(config["schema"]) + [f'Data set "{i}" no longer exists.' for i in missing]
+		view = {"id": project.id, "config": config}
+		if decisions.is_decision_spec(config):
+			questions, problems = decisions.schema_questions(config["schema"])
+			if config.get("input_kind") == "image":
+				problems.append("Decision models read text for now. Switch the answer back to JSON for image projects.")
+			view.update(
+				schema_errors=errors + problems,
+				system_prompt=decisions.system_prompt(config.get("instructions", "")),
+				decision={"questions": [decisions.api_question(q) for q in questions], "problems": problems},
+			)
+			return view
+		view.update(
+			schema_errors=errors,
+			system_prompt=build_system_prompt(
 				config.get("instructions", ""), config["schema"], config.get("include_schema_in_prompt", True), names
 			),
-		}
+		)
+		return view
 
 	@app.get("/api/system")
 	def system(refresh: bool = False):
@@ -328,6 +340,8 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		options = read_json(run_dir / "export" / "options.json", {}) or {}
 		export_status = read_json(run_dir / "export" / "status.json", {}) or {}
 		name = options.get("ollama_name") or model_name(spec)
+		if decisions.is_decision_spec(spec):
+			return {"name": name, "datasets": {}, "snippets": all_decision_snippets(name, spec["questions"], str(run_dir))}
 		manifest = read_json(run_dir / "export" / "llmzempic.json", {}) or {}
 		schema, refs = export_contract(spec["schema"], spec.get("datasets"))
 		return {

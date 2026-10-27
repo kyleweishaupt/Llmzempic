@@ -67,7 +67,10 @@ def render_chat(tokenizer, messages, add_generation_prompt):
 
 def tokenize_example(tokenizer, system_prompt, user_input, output):
 	"""Tokenize one example; loss is computed only on the assistant's answer tokens."""
-	answer = format_output(output)
+	return tokenize_answer(tokenizer, system_prompt, user_input, format_output(output))
+
+
+def tokenize_answer(tokenizer, system_prompt, user_input, answer):
 	prompt_text = render_chat(tokenizer, build_messages(system_prompt, user_input), True)
 	full_text = render_chat(tokenizer, build_messages(system_prompt, user_input, answer), False)
 	if full_text.startswith(prompt_text):

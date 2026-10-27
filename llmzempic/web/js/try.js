@@ -6,6 +6,7 @@ import { jsonBlock } from "./json-view.js";
 import { addExamples } from "./example-ops.js";
 import { loadPage } from "./project.js";
 import { blankOutput } from "./schema-model.js";
+import { pct } from "./format.js";
 import { S, activeJob, app } from "./state.js";
 
 const JOB_LABEL = { train: "training", export: "export", predict: "try" };
@@ -78,13 +79,39 @@ async function addAsExample(it, ok) {
 	toast("Added as an example. Check its answer on the Examples tab, then train again.", false, { label: "Open", onclick: () => app.showTab("examples") });
 }
 
+const MAX_SHOWN = 8;
+
+function decisionAnswers(response) {
+	return h("div", { class: "decision-answers" },
+		response.answers.map((a) => {
+			let rows = a.type === "predicate" ? [["Yes", a.probability], ["No", 1 - a.probability]] : Object.entries(a.probabilities);
+			const top = rows.reduce((best, row) => (row[1] > best[1] ? row : best), rows[0])[0];
+			if (a.type === "choice") rows = rows.sort((x, y) => y[1] - x[1]);
+			const hidden = rows.length - MAX_SHOWN;
+			return h("div", { class: "decision" },
+				h("div", { class: "spread" },
+					h("span", { class: "row-tight" }, h("code", {}, a.name), h("span", { class: "faint small" }, a.type)),
+					h("span", { class: "muted small" }, a.type === "score" && a.score !== null ? `score ${a.score.toFixed(2)}, ` : "", `confidence ${pct(a.confidence)}`),
+				),
+				rows.slice(0, MAX_SHOWN).map(([label, p]) => h("div", { class: label === top ? "prob-row top" : "prob-row" },
+					h("span", { class: "prob-label ellipsis", title: label }, label),
+					h("span", { class: "rate-bar" }, h("span", { style: { width: `${p * 100}%` } })),
+					h("span", { class: "num" }, pct(p)),
+				)),
+				hidden > 0 ? h("span", { class: "faint small" }, `…and ${hidden} more options`) : null,
+			);
+		}),
+		h("p", { class: "faint small" }, `${response.usage.input_tokens} input tokens read, nothing generated.`),
+	);
+}
+
 function result(run, it) {
 	const ok = it.json_valid && !it.errors.length;
 	return h("div", { class: "try-result" },
 		it.image ? h("img", { class: "try-thumb", src: runImageUrl(S.pid, run.id, it.image), alt: "" }) : null,
 		h("div", { class: "stack grow" },
 			it.input ? h("p", { class: "muted small" }, it.input) : null,
-			it.json_valid ? jsonBlock(it.value) : h("pre", { class: "code-block" }, it.generated || "(no answer)"),
+			it.decisions ? decisionAnswers(it.decisions) : it.json_valid ? jsonBlock(it.value) : h("pre", { class: "code-block" }, it.generated || "(no answer)"),
 			h("div", { class: "spread" },
 				ok ? pill("Matches the schema", "good", { iconName: "check" }) : pill(it.errors[0], it.json_valid ? "warn" : "bad", { iconName: "alert" }),
 				button(ok ? "Add as example" : "Add as example to correct", { icon: "plus", kind: "secondary", size: "sm", title: "Add this input as a training example, with this answer as its expected output", onclick: () => addAsExample(it, ok) }),

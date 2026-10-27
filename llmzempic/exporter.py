@@ -24,8 +24,9 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import vision
+from . import decisions, vision
 from .datasets import run_resolver
+from .decision_snippets import all_decision_snippets, request_body
 from .fileio import read_json, read_jsonl, write_json
 from .grammar import values_grammar
 from .refs import export_contract, referenced_ids
@@ -237,7 +238,89 @@ def write_grammar(llama_dir, export_dir):
 	return True
 
 
+def decision_readme(spec, name, gguf_file, metrics):
+	report = (metrics or {}).get("decisions") or {}
+	lines = [
+		f"# {name}: decision model",
+		"",
+		f"Fine-tuned by Llmzempic from `{spec['base_model']}` to answer typed questions with calibrated probabilities:",
+		"",
+	]
+	for q in spec["questions"]:
+		options = "yes / no" if q["type"] == "predicate" else ", ".join(q["options"])
+		lines.append(f"- `{q['name']}` ({q['type']}): {options}")
+	if report:
+		lines += ["", f"Held-out accuracy {report['accuracy']:.0%}, expected calibration error {report['after_calibration']['ece']:.3f} "
+			f"(temperature {report['temperature']})."]
+	lines += [
+		"",
+		"## Decisions API",
+		"",
+		"Serve the run (base model + LoRA adapter) with Llmzempic and POST `integration/decisions-request.json`:",
+		"",
+		"```",
+		'llmzempic serve --run "<run folder>"',
+		"curl http://localhost:7871/v1/decisions -H \"Content-Type: application/json\" -d @integration/decisions-request.json",
+		"```",
+		"",
+		"Every question is read from one batched forward pass: no text is generated, so answers cost input tokens only.",
+		"Leave `questions` out to ask all of them, or name one and leave out the rest of its definition. Clients for",
+		"Python, PHP and C# are in `integration/`.",
+	]
+	if gguf_file:
+		lines += [
+			"",
+			"## GGUF",
+			"",
+			f"`{gguf_file}` answers each question's prompt (`decisions.json` has the system prompt and one user prompt per",
+			"question) with the number of the best option. For probabilities, read the probability of every option number",
+			"(llama-server `n_probs`), normalize over the options and divide the log-probabilities by `temperature`.",
+		]
+	return "\n".join(lines) + "\n"
+
+
+def write_decision_files(export_dir, spec, name, gguf_file, ctx, metrics):
+	"""Decision runs: the questions, prompts and calibration temperature, and Decisions API clients."""
+	integration = export_dir / "integration"
+	integration.mkdir(parents=True, exist_ok=True)
+	questions = spec["questions"]
+	report = (metrics or {}).get("decisions") or {}
+	(export_dir / "system_prompt.txt").write_text(spec["system_prompt"], encoding="utf-8")
+	if gguf_file:
+		(export_dir / "Modelfile").write_text(modelfile_text(spec, gguf_file, ctx), encoding="utf-8")
+	contract = {
+		"name": name,
+		"questions": [decisions.api_question(q) for q in questions],
+		"system_prompt": spec["system_prompt"],
+		"user_prompts": {q["name"]: decisions.user_prompt("{input}", q) for q in questions},
+		"answer": "The number of one option, as listed in the prompt (numbers are zero-padded to one width).",
+		"temperature": report.get("temperature", 1.0),
+	}
+	write_json(export_dir / "decisions.json", contract)
+	snippets = all_decision_snippets(name, questions)
+	(integration / f"{snake(name)}_decisions.py").write_text(snippets["python"], encoding="utf-8")
+	(integration / "decisions.php").write_text(snippets["php"], encoding="utf-8")
+	(integration / f"{pascal(name)}Decisions.cs").write_text(snippets["csharp"], encoding="utf-8")
+	(integration / "decisions-request.json").write_text(json.dumps(request_body(name, questions), indent=2, ensure_ascii=False), encoding="utf-8")
+	(export_dir / "README.md").write_text(decision_readme(spec, name, gguf_file, metrics), encoding="utf-8")
+	write_json(export_dir / "llmzempic.json", {
+		"name": name,
+		"project": spec["project_name"],
+		"base_model": spec["base_model"],
+		"input_kind": "text",
+		"answer_mode": "decisions",
+		"gguf": gguf_file,
+		"context_size": ctx,
+		"decisions": contract,
+		"metrics": metrics,
+		"exported": time.time(),
+	})
+
+
 def write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file=None, image_tokens=None):
+	if decisions.is_decision_spec(spec):
+		write_decision_files(export_dir, spec, name, gguf_file, ctx, metrics)
+		return
 	integration = export_dir / "integration"
 	integration.mkdir(parents=True, exist_ok=True)
 	schema, refs = export_contract(spec["schema"], spec.get("datasets"))
@@ -347,7 +430,7 @@ def run_export(run_dir, status):
 					f"with: ollama create {name} --quantize {ollama_quantize} -f Modelfile"
 				)
 		write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file, image_tokens)
-		if not has_refs:
+		if not has_refs and not decisions.is_decision_spec(spec):
 			status.update(stage="Building grammar")
 			if not write_grammar(llama_dir, export_dir):
 				log("grammar.gbnf not generated (no Python schema converter in this llama.cpp); Ollama and llama-server use schema.json directly.")

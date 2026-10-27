@@ -11,7 +11,69 @@ function tone(rate) {
 	return rate >= 0.9 ? "good" : rate >= 0.6 ? "warn" : "bad";
 }
 
+// Calibration error: how far confidence is from accuracy (lower is better; 0.05 or less is well calibrated).
+const eceTone = (v) => (v <= 0.05 ? "good" : v <= 0.1 ? "warn" : "bad");
+const fixed = (v, digits = 3) => (v === null || v === undefined ? "–" : Number(v).toFixed(digits));
+
+function decisionTiles(m) {
+	const d = m.decisions;
+	const cal = d.after_calibration || d;
+	return h("div", { class: "stack" },
+		h("div", { class: "metrics" },
+			h("div", { class: `metric hero ${tone(d.accuracy)}` },
+				h("span", { class: "metric-value num" }, pct(d.accuracy)),
+				h("span", { class: "metric-label" }, "Accuracy"),
+				h("span", { class: "faint small" }, "Top answers that are right, over all questions"),
+			),
+			h("div", { class: `metric ${eceTone(cal.ece)}`, title: "Expected calibration error after temperature scaling: the gap between confidence and accuracy" },
+				h("span", { class: "metric-value num" }, fixed(cal.ece)),
+				h("span", { class: "metric-label" }, "Calibration error"),
+			),
+			d.baseline ? h("div", { class: "metric", title: "The base model reading the same prompts without fine-tuning" },
+				h("span", { class: "metric-value num" }, pct(d.baseline.accuracy)),
+				h("span", { class: "metric-label" }, "Base model"),
+			) : null,
+			d.latency_ms ? h("div", { class: "metric", title: "Time to read every question for one input, on the training machine" },
+				h("span", { class: "metric-value num" }, `${Math.round(d.latency_ms.p50)} ms`),
+				h("span", { class: "metric-label" }, "Per input (p50)"),
+			) : null,
+		),
+		h("p", { class: "faint small" }, `Scored ${d.count} answers on ${m.count} ${m.eval_on || "examples"}; all questions right on ${pct(m.exact_match)}. `,
+			d.calibrated
+				? `Probabilities are calibrated with temperature ${d.temperature} (calibration error ${fixed(d.ece)} before). `
+				: "Probabilities aren't rescaled: 50 or more held-out answers are needed to fit a calibration temperature. ",
+			`About ${d.input_tokens} input tokens per input; nothing is generated.`),
+	);
+}
+
+function decisionBreakdown(d) {
+	if (!d || !d.questions || !d.questions.length) return null;
+	const base = Object.fromEntries(((d.baseline && d.baseline.questions) || []).map((q) => [q.name, q]));
+	return h("div", { class: "breakdown stack" },
+		h("h4", {}, "Per question"),
+		h("div", { class: "table-wrap" }, h("table", { class: "decision-table" },
+			h("thead", {}, h("tr", {},
+				h("th", {}, "Question"),
+				h("th", { class: "num" }, "Answers"),
+				h("th", {}, "Accuracy"),
+				h("th", { class: "num", title: "Accuracy of the base model without fine-tuning" }, "Base"),
+				h("th", { class: "num", title: "Expected calibration error after temperature scaling (lower is better)" }, "Calibration"),
+				h("th", { class: "num", title: "Brier score (lower is better)" }, "Brier"),
+			)),
+			h("tbody", {}, d.questions.map((q) => h("tr", {},
+				h("td", {}, h("code", {}, q.name), h("span", { class: "faint" }, ` ${q.type}`), q.mae !== undefined ? h("span", { class: "faint small", title: "Mean distance between the expected score and the right level" }, ` ±${fixed(q.mae, 2)} levels`) : null),
+				h("td", { class: "num" }, String(q.count)),
+				rateBar(Math.round(q.accuracy * q.count), q.count),
+				h("td", { class: "num" }, base[q.name] ? pct(base[q.name].accuracy) : "–"),
+				h("td", { class: `num ${eceTone(q.ece)}-text` }, fixed(q.ece)),
+				h("td", { class: "num" }, fixed(q.brier)),
+			))),
+		)),
+	);
+}
+
 export function metricTiles(m) {
+	if (m.decisions) return decisionTiles(m);
 	return h("div", { class: "stack" },
 		h("div", { class: "metrics" },
 			h("div", { class: `metric hero ${tone(m.exact_match)}` },
@@ -136,7 +198,8 @@ export function evaluationView(ev) {
 	fill();
 	return h("div", { class: "stack-lg" },
 		metricTiles(ev),
-		fields.length > 1 ? h("div", { class: "field-acc" }, h("span", { class: "muted small" }, "Per field"),
+		decisionBreakdown(ev.decisions),
+		fields.length > 1 && !ev.decisions ? h("div", { class: "field-acc" }, h("span", { class: "muted small" }, "Per field"),
 			fields.map(([k, v]) => h("span", { class: `chip ${tone(v)}-chip-lite` }, h("code", {}, k), h("span", { class: "count" }, pct(v))))) : null,
 		labelBreakdown(ev.labels),
 		refBreakdown(ev.refs),

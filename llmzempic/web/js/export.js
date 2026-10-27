@@ -15,7 +15,7 @@ const GGUF = {
 	none: ["No GGUF", "Adapter and client files only."],
 };
 
-const SNIPPETS = [["php", "PHP"], ["csharp", "C#"], ["python", "Python"], ["llama_server", "llama-server"]];
+const SNIPPETS = [["php", "PHP"], ["csharp", "C#"], ["python", "Python"], ["llama_server", "llama-server"], ["curl", "Decisions API"]];
 
 async function startExport(opts, btn) {
 	btn.disabled = true;
@@ -112,10 +112,12 @@ async function renderSnippets(box) {
 			return;
 		}
 	}
+	const tabs = SNIPPETS.filter(([k]) => k in S.snippets);
+	if (!(S.snippetTab in S.snippets)) S.snippetTab = tabs[0][0];
 	const code = S.snippets[S.snippetTab] || "";
 	mount(box,
 		h("div", { class: "spread" },
-			h("div", { class: "tabs", role: "tablist" }, SNIPPETS.map(([k, label]) => h("button", {
+			h("div", { class: "tabs", role: "tablist" }, tabs.map(([k, label]) => h("button", {
 				type: "button", role: "tab", "aria-selected": String(k === S.snippetTab), onclick: () => { S.snippetTab = k; renderSnippets(box); },
 			}, label))),
 			button("Copy", { icon: "copy", kind: "ghost", size: "sm", onclick: async () => { await navigator.clipboard.writeText(code); toast("Copied"); } }),
@@ -138,7 +140,8 @@ export function renderExport() {
 	}
 	const run = S.run;
 	const select = h("select", { "aria-label": "Run to export" }, completed.map((r) => h("option", { value: r.id, selected: r.id === S.runId },
-		`${when(r.created) || r.id}, ${shortModel(r.base_model)}, exact match ${pct(r.metrics && r.metrics.exact_match)}`)));
+		`${when(r.created) || r.id}, ${shortModel(r.base_model)}, ${r.metrics && r.metrics.decisions
+			? `accuracy ${pct(r.metrics.decisions.accuracy)}` : `exact match ${pct(r.metrics && r.metrics.exact_match)}`}`)));
 	select.addEventListener("change", async () => {
 		try { await selectRun(select.value); } catch (e) { toastError(e); }
 		renderExport();

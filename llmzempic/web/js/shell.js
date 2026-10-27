@@ -98,8 +98,10 @@ function stepInfo(tab) {
 		if (mine && job.kind === "train") return ["running", "Training…"];
 		const done = S.runs.filter((r) => r.status.state === "completed");
 		if (!done.length) return ["todo", S.runs.length ? plural(S.runs.length, "run") : "Not trained"];
-		const best = Math.max(...done.map((r) => (r.metrics && r.metrics.exact_match) || 0));
-		return ["done", `Best exact match ${pct(best)}`];
+		// Decision runs are scored by accuracy over all questions; JSON runs by exact match.
+		const score = (m) => (m ? (m.decisions ? m.decisions.accuracy : m.exact_match) : 0) || 0;
+		const best = Math.max(...done.map((r) => score(r.metrics)));
+		return ["done", `${done.some((r) => r.metrics && r.metrics.decisions) ? "Best accuracy" : "Best exact match"} ${pct(best)}`];
 	}
 	if (mine && job.kind === "export") return ["running", "Exporting…"];
 	return S.runs.some((r) => r.export && r.export.state === "completed") ? ["done", "Exported"] : ["todo", "Not exported"];
@@ -122,7 +124,8 @@ export function renderStepper() {
 
 export function renderProjectHead() {
 	mount($("#project-title"), S.config.name || S.pid);
-	mount($("#kind-slot"), pill(isImageProject() ? "Images" : "Text", "", { iconName: isImageProject() ? "image" : "text" }));
+	mount($("#kind-slot"), pill(isImageProject() ? "Images" : "Text", "", { iconName: isImageProject() ? "image" : "text" }),
+		S.config.answer_mode === "decisions" ? pill("Decisions", "info", { iconName: "sliders" }) : null);
 	mount($("#project-menu"), menu(button(null, { icon: "more", kind: "ghost", title: "Project actions" }), [
 		{ label: "Export package…", icon: "download", onclick: exportPackageDialog },
 		{ label: "Duplicate project", icon: "copy", onclick: duplicateProject },

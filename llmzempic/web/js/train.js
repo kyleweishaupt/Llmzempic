@@ -95,7 +95,8 @@ function runItem(run) {
 			h("span", { class: "faint small ellipsis" }, `${shortModel(run.base_model)}, ${run.train_count} train / ${run.eval_count} held out`),
 		),
 		h("span", { class: "run-item-score" },
-			m && m.exact_match !== undefined ? h("span", { class: "num score" }, pct(m.exact_match)) : null,
+			m && m.decisions ? h("span", { class: "num score", title: "Accuracy" }, pct(m.decisions.accuracy))
+				: m && m.exact_match !== undefined ? h("span", { class: "num score" }, pct(m.exact_match)) : null,
 			statePill(run.status),
 		),
 	);

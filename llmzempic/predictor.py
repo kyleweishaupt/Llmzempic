@@ -6,7 +6,7 @@ for image runs) from predict/request.json with greedy decoding and writes predic
 
 import os
 
-from . import vision
+from . import decisions, vision
 from .fileio import JsonlRows, read_json, read_jsonl, write_json
 from .metrics import parse_generated
 from .prompts import FALLBACK_CHAT_TEMPLATE, format_output
@@ -51,6 +51,18 @@ def run_prediction(run_dir, status):
 	status.update(stage="Loading the trained model", plan=plan.describe())
 	model, processor = load_trained(spec, run_dir / "adapter", plan)
 	tokenizer = processor.tokenizer if plan.vision else processor
+
+	if decisions.is_decision_spec(spec):
+		from .decision_engine import predict_items, run_temperature
+		from .runs import model_name
+
+		status.update(stage=f"Answering {len(rows)} input(s)")
+		log(f"Reading decisions for {len(rows)} input(s)")
+		items = predict_items(model, tokenizer, spec, run_temperature(run_dir), inputs, model_name(spec))
+		write_json(run_dir / "predict" / "result.json", {"items": items})
+		log("Done")
+		status.update(state="completed", stage="Completed")
+		return
 
 	# Room for the longest answer seen in training, like the evaluation after training.
 	# A sample is enough to size the answer; a run can have hundreds of thousands of training rows.

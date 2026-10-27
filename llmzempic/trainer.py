@@ -12,7 +12,7 @@ import os
 import shutil
 import time
 
-from . import vision
+from . import decision_engine, decisions, vision
 from .fileio import JsonlRows, append_jsonl, read_json, read_jsonl, write_json
 from .hardware import estimate_memory_gb
 from .metrics import score_predictions
@@ -62,11 +62,17 @@ class Plan:
 
 		accel = t.get("accelerator", "auto")
 		self.vision = vision.is_vision(spec)
+		# Decision training reads logits (KL anchor, option scores), which Unsloth's fused loss doesn't return.
+		self.decisions = decisions.is_decision_spec(spec)
 		self.unsloth = (
-			self.cuda and not self.vision and accel in ("auto", "unsloth") and importlib.util.find_spec("unsloth") is not None
+			self.cuda and not self.vision and not self.decisions and accel in ("auto", "unsloth")
+			and importlib.util.find_spec("unsloth") is not None
 		)
 		if accel == "unsloth" and not self.unsloth:
-			reason = "isn't used for image projects" if self.vision else "needs an NVIDIA GPU and `pip install unsloth`"
+			reason = (
+				"isn't used for image projects" if self.vision else "isn't used for decision models" if self.decisions
+				else "needs an NVIDIA GPU and `pip install unsloth`"
+			)
 			log(f"Unsloth was requested but {reason}; using standard PEFT.")
 
 		if self.cuda and torch.cuda.is_bf16_supported():
@@ -263,6 +269,23 @@ def run_training(run_dir, status):
 				log(f"Skipped {before - len(train_features)} training example(s) longer than {max_len} tokens.")
 		lengths = [feature_length(f) for f in train_features + eval_features]
 		answer_tokens = max(len(tokenizer(format_output(r["output"]), add_special_tokens=False)["input_ids"]) for r in list(train_rows) + eval_rows)
+	elif plan.decisions:
+		# One sequence per (example, question); options are reshuffled every time a sequence is drawn.
+		items, measured = decision_engine.training_items(train_rows, tokenizer, spec,
+			lambda done, total: status.update(stage=f"Measuring examples ({done:,} of {total:,})"))
+		keep, skipped = select_within(measured, max_len)
+		eval_items, eval_measured = decision_engine.training_items(eval_rows, tokenizer, spec, lambda done, total: None)
+		eval_keep, eval_skipped = select_within(eval_measured, max_len)
+		if skipped or eval_skipped:
+			ids = sorted({train_rows[items[i][0]]["id"] for i in skipped} | {eval_rows[eval_items[i][0]]["id"] for i in eval_skipped})
+			write_json(run_dir / "skipped.json", {"max_length": max_len, "ids": ids})
+			log(f"Skipped {len(ids)} example(s) with a question longer than {max_len} tokens; their ids are in skipped.json.")
+		train_features = decision_engine.DecisionFeatures(train_rows, [items[i] for i in keep], tokenizer, spec, int(t.get("seed") or 42))
+		eval_features = list(decision_engine.DecisionFeatures(eval_rows, [eval_items[i] for i in eval_keep], tokenizer, spec))
+		collator = PadCollator(tokenizer.pad_token_id, 8 if plan.cuda else None)
+		lengths = [measured[i] for i in keep] + [eval_measured[i] for i in eval_keep]
+		answer_tokens = 8
+		log(f"{len(spec['questions'])} question(s): " + ", ".join(f"{q['name']} ({q['type']}, {len(q['options'])} options)" for q in spec["questions"]))
 	else:
 		measured = measure_lengths(tokenizer, system_prompt, train_rows, 500,
 			lambda done, total: status.update(stage=f"Measuring examples ({done:,} of {total:,})"))
@@ -349,7 +372,10 @@ def run_training(run_dir, status):
 			if "eval_loss" in event:
 				log(f"epoch {event['epoch']}  eval loss {event['eval_loss']:.4f}")
 
-	trainer = Trainer(
+	kl_weight = float(t.get("kl_weight") or 0) if plan.decisions else 0.0
+	if kl_weight > 0:
+		log(f"KL anchor to the base model, weight {kl_weight}")
+	trainer = (decision_engine.anchored_trainer(Trainer, kl_weight) if kl_weight > 0 else Trainer)(
 		model=model,
 		args=args,
 		train_dataset=train_features,
@@ -387,11 +413,22 @@ def run_training(run_dir, status):
 		rows, eval_on = [train_rows[i] for i in range(min(20, len(train_rows)))], "training examples (add 10+ examples for a held-out test)"
 	max_new = min(4096, int(answer_tokens * 1.5) + 32)
 	log(f"Evaluating on {len(rows)} {eval_on}")
-	texts = answer(model, processor, spec, rows, run_dir / "images", max_new, max(1, batch_size), torch)
-	evaluation = score_predictions(rows, texts, spec["schema"])
+	if plan.decisions:
+		evaluation = decision_engine.evaluate(model, tokenizer, spec, rows, log)
+		report = evaluation["decisions"]
+		write_json(run_dir / "calibration.json", {"temperature": report["temperature"], "fitted": report["calibrated"], "count": report["count"]})
+		base = f" (base model {report['baseline']['accuracy']:.0%})" if report["baseline"] else ""
+		log(
+			f"Accuracy {report['accuracy']:.0%}{base}  ECE {report['ece']:.3f}, "
+			f"{report['after_calibration']['ece']:.3f} at temperature {report['temperature']}  "
+			f"all questions right {evaluation['exact_match']:.0%}"
+		)
+	else:
+		texts = answer(model, processor, spec, rows, run_dir / "images", max_new, max(1, batch_size), torch)
+		evaluation = score_predictions(rows, texts, spec["schema"])
+		log(f"JSON valid {evaluation['json_valid']:.0%}  schema valid {evaluation['schema_valid']:.0%}  exact match {evaluation['exact_match']:.0%}")
 	evaluation["eval_on"] = eval_on
 	write_json(run_dir / "eval.json", evaluation)
-	log(f"JSON valid {evaluation['json_valid']:.0%}  schema valid {evaluation['schema_valid']:.0%}  exact match {evaluation['exact_match']:.0%}")
 	status.update(
 		state="completed",
 		stage="Completed",

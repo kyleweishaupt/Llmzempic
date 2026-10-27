@@ -1,5 +1,5 @@
 import { api } from "./api.js";
-import { $, button, callout, field, h, icon, menu, mount, seg, toggleSwitch } from "./dom.js";
+import { $, button, callout, field, h, icon, menu, mount, pill, seg, toggleSwitch } from "./dom.js";
 import { confirmAction, saver, toast, toastError } from "./feedback.js";
 import { jsonBlock } from "./json-view.js";
 import { scheduleConfigSave } from "./project.js";
@@ -11,6 +11,56 @@ const KIND_CARDS = [
 	["text", "text", "Text", "Messages, documents, file contents."],
 	["image", "image", "Images", "Photos or screenshots, with optional text."],
 ];
+
+const ANSWER_CARDS = [
+	["json", "braces", "JSON", "Generates a JSON object shaped like the output below."],
+	["decisions", "sliders", "Decisions", "Probabilities for every option of each option list and yes/no field. Fast: nothing is generated."],
+];
+
+const SCORE_KEY = "x-score";
+const isDecisions = () => S.config.answer_mode === "decisions";
+
+// The questions a decision model answers: one per top-level option list (choice, or score when ordered) or yes/no field.
+function decisionQuestions() {
+	const props = (S.config.schema && S.config.schema.properties) || {};
+	return Object.entries(props).map(([name, prop]) => {
+		if (prop && Array.isArray(prop.enum)) return { name, prop, type: prop[SCORE_KEY] ? "score" : "choice", options: prop.enum };
+		if (prop && prop.type === "boolean") return { name, prop, type: "predicate", options: ["Yes", "No"] };
+		return { name, prop, type: null, options: [] };
+	});
+}
+
+function setScore(prop, ordered) {
+	if (ordered) prop[SCORE_KEY] = true;
+	else delete prop[SCORE_KEY];
+	scheduleConfigSave();
+	renderTask();
+}
+
+function questionsCard() {
+	const questions = decisionQuestions();
+	const TYPE = { choice: "Choice", score: "Score", predicate: "Yes / no" };
+	return h("section", { class: "card" },
+		h("div", { class: "card-head" },
+			h("div", {},
+				h("h2", { class: "section-title" }, "Questions"),
+				h("p", { class: "muted small" }, "Each output field is a question, asked on its own. The model answers with the number of an option, and every option gets a calibrated probability."),
+			),
+		),
+		h("div", { class: "card-body stack" },
+			questions.length ? h("ul", { class: "question-list" }, questions.map((q) => h("li", { class: "question" },
+				h("div", { class: "spread" },
+					h("span", { class: "row-tight" }, h("code", {}, q.name), q.type ? pill(TYPE[q.type], q.type === "predicate" ? "info" : "") : pill("Not a question", "bad", { iconName: "alert" })),
+					q.type === "choice" || q.type === "score"
+						? seg([["choice", "Choice"], ["score", "Ordered score"]], q.type, (v) => setScore(q.prop, v === "score"), { label: `${q.name} answer type` })
+						: null,
+				),
+				h("span", { class: "muted small" }, q.prop && q.prop.description ? q.prop.description : q.type ? "Add a description to the field to phrase the question." : "Only option lists and yes/no fields can be questions."),
+				q.options.length ? h("span", { class: "faint small ellipsis" }, q.type === "score" ? `Levels, lowest first: ${q.options.join(" < ")}` : q.options.join(", ")) : null,
+			))) : h("p", { class: "faint" }, "Add option lists or yes/no fields to the output."),
+		),
+	);
+}
 
 function pane() { return $("#tab-task"); }
 
@@ -118,7 +168,9 @@ function outputCard() {
 		h("div", { class: "card-head" },
 			h("div", {},
 				h("h2", { class: "section-title" }, "Output"),
-				h("p", { class: "muted small" }, "The JSON object the model answers with. Every example is checked against it."),
+				h("p", { class: "muted small" }, isDecisions()
+					? "The answers as a JSON object: examples are labeled with it, and the model's top answers come back in this shape."
+					: "The JSON object the model answers with. Every example is checked against it."),
 			),
 			h("div", { class: "row" },
 				seg([["visual", "Visual"], ["json", "JSON Schema"]], mode, (m) => { S.schemaMode = m; renderTask(); }, { label: "Editor", disabled: !parsed.ok }),
@@ -133,7 +185,7 @@ function outputCard() {
 			parsed.ok ? null : callout("info", "info", h("b", {}, "Edit as JSON. "), `${parsed.reason} The visual editor covers text, numbers, yes/no, option lists, lists and nested groups.`),
 			body,
 			h("div", { id: "schema-errors", class: "stack" }),
-			toggleSwitch("Include the schema in the system prompt (recommended)", S.config.include_schema_in_prompt !== false, (v) => {
+			isDecisions() ? null : toggleSwitch("Include the schema in the system prompt (recommended)", S.config.include_schema_in_prompt !== false, (v) => {
 				S.config.include_schema_in_prompt = v;
 				scheduleConfigSave();
 			}),
@@ -154,6 +206,7 @@ function basicsCard() {
 		scheduleConfigSave();
 	});
 	const kind = S.config.input_kind || "text";
+	const answer = S.config.answer_mode || "json";
 	return h("section", { class: "card card-pad stack-lg" },
 		field("Name", name),
 		h("div", { class: "field" },
@@ -162,6 +215,13 @@ function basicsCard() {
 				type: "button", role: "radio", class: "choice-card", "aria-checked": String(kind === value), onclick: () => setInputKind(value),
 			}, h("span", { class: "choice-icon" }, icon(iconName)), h("span", {}, h("b", {}, title), h("span", { class: "muted small" }, text)),
 				kind === value ? icon("check-circle", "choice-check") : null))),
+		),
+		h("div", { class: "field" },
+			h("span", { class: "field-label" }, "Answer"),
+			h("div", { class: "choice-cards", role: "radiogroup", "aria-label": "Answer type" }, ANSWER_CARDS.map(([value, iconName, title, text]) => h("button", {
+				type: "button", role: "radio", class: "choice-card", "aria-checked": String(answer === value), onclick: () => setAnswerMode(value),
+			}, h("span", { class: "choice-icon" }, icon(iconName)), h("span", {}, h("b", {}, title), h("span", { class: "muted small" }, text)),
+				answer === value ? icon("check-circle", "choice-check") : null))),
 		),
 		field("Instructions", instructions, { help: "Tell the model what to decide. This becomes its system prompt, so be specific about edge cases." }),
 	);
@@ -188,9 +248,17 @@ function asideCard() {
 	);
 }
 
+function setAnswerMode(mode) {
+	if (mode === (S.config.answer_mode || "json")) return;
+	S.config.answer_mode = mode;
+	scheduleConfigSave();
+	app.renderProjectHead();
+	renderTask();
+}
+
 export function renderTask() {
 	mount(pane(), h("div", { class: "task-grid" },
-		h("div", { class: "stack-lg" }, basicsCard(), outputCard()),
+		h("div", { class: "stack-lg" }, basicsCard(), isDecisions() ? questionsCard() : null, outputCard()),
 		asideCard(),
 	));
 	updateServerBits();

@@ -4,7 +4,7 @@ import json
 import re
 import time
 
-from . import __version__
+from . import __version__, decisions
 from .dataset import split_examples, split_keys
 from .fileio import read_json, write_json, write_jsonl
 from .images import image_path, link_images
@@ -43,6 +43,14 @@ def create_run(project, library, checker):
 		raise RunError(f"{entry['name']} can't read images. Pick a vision model on the Model tab.")
 	if entry and input_kind != "image" and entry.get("vision"):
 		raise RunError(f"{entry['name']} is a vision model. Pick a text model on the Model tab.")
+	answer_mode = "decisions" if decisions.is_decision_spec(config) else "json"
+	questions = None
+	if answer_mode == "decisions":
+		if input_kind == "image":
+			raise RunError("Decision models read text for now. Switch the answer back to JSON on the Task tab for image projects.")
+		questions, problems = decisions.schema_questions(schema)
+		if problems:
+			raise RunError(problems[0])
 	store = project.examples()
 	if store.count() < 2:
 		raise RunError("Add at least 2 examples (20 or more is recommended).")
@@ -96,7 +104,9 @@ def create_run(project, library, checker):
 		"instructions": config.get("instructions", ""),
 		"schema": schema,
 		"datasets": datasets,
-		"system_prompt": build_system_prompt(
+		"answer_mode": answer_mode,
+		"questions": questions,
+		"system_prompt": decisions.system_prompt(config.get("instructions", "")) if questions else build_system_prompt(
 			config.get("instructions", ""), schema, config.get("include_schema_in_prompt", True),
 			{dataset_id: d["name"] for dataset_id, d in datasets.items()},
 		),
@@ -201,6 +211,7 @@ def run_summary(run_dir):
 		"eval_count": spec.get("eval_count"),
 		"split": spec.get("split"),
 		"input_kind": spec.get("input_kind", "text"),
+		"answer_mode": spec.get("answer_mode", "json"),
 		"datasets": spec.get("datasets") or {},
 		"model_name": model_name(spec),
 		"status": status,
