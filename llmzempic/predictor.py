@@ -53,12 +53,13 @@ def run_prediction(run_dir, status):
 	tokenizer = processor.tokenizer if plan.vision else processor
 
 	if decisions.is_decision_spec(spec):
-		from .decision_engine import predict_items, run_temperature
+		from .decision_engine import make_reader, predict_items, run_calibration
 		from .runs import model_name
 
 		status.update(stage=f"Answering {len(rows)} input(s)")
 		log(f"Reading decisions for {len(rows)} input(s)")
-		items = predict_items(model, tokenizer, spec, run_temperature(run_dir), inputs, model_name(spec))
+		reader = make_reader(model, processor, spec)
+		items = predict_items(reader, spec, run_calibration(run_dir), rows, model_name(spec), run_dir / "images")
 		write_json(run_dir / "predict" / "result.json", {"items": items})
 		log("Done")
 		status.update(state="completed", stage="Completed")

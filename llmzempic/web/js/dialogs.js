@@ -66,10 +66,14 @@ export async function settingsDialog() {
 	}
 	const token = h("input", { type: "password", autocomplete: "off", placeholder: data.hf_token_set ? "Saved. Type to replace it." : "hf_…" });
 	const llama = h("input", { type: "text", class: "code", spellcheck: "false", value: data.llama_cpp_dir || "" });
+	const genUrl = h("input", { type: "text", class: "code", spellcheck: "false", value: data.generator_url || "" });
+	const genModel = h("input", { type: "text", class: "code", spellcheck: "false", value: data.generator_model || "", placeholder: "e.g. qwen2.5:14b" });
+	const genKey = h("input", { type: "password", autocomplete: "off", placeholder: data.generator_key_set ? "Saved. Type to replace it." : "Only if the endpoint needs one" });
 	modal((close) => h("form", { method: "dialog", onsubmit: async (e) => {
 		e.preventDefault();
-		const body = { llama_cpp_dir: llama.value.trim() };
+		const body = { llama_cpp_dir: llama.value.trim(), generator_url: genUrl.value.trim(), generator_model: genModel.value.trim() };
 		if (token.value.trim()) body.hf_token = token.value.trim();
+		if (genKey.value.trim()) body.generator_key = genKey.value.trim();
 		try {
 			await api("/settings", { method: "PUT", body });
 			close();
@@ -82,6 +86,9 @@ export async function settingsDialog() {
 		h("div", { class: "dialog-body" },
 			field("Hugging Face token", token, { help: "Needed for gated models such as Llama and Gemma. Stored in your workspace, never shown again." }),
 			field("llama.cpp folder", llama, { hint: "optional", help: "Downloaded automatically on first export when empty." }),
+			field("Example generator URL", genUrl, { hint: "optional", help: "An OpenAI-compatible endpoint (Ollama, llama-server, vLLM, OpenAI) that writes synthetic examples." }),
+			field("Generator model", genModel),
+			field("Generator API key", genKey, { hint: "optional" }),
 			h("p", { class: "faint small" }, "Workspace: ", h("code", {}, S.system ? S.system.workspace : "")),
 		),
 		h("div", { class: "dialog-foot" },

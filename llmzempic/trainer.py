@@ -12,10 +12,11 @@ import os
 import shutil
 import time
 
-from . import decision_engine, decisions, vision
+from . import decision_engine, decision_monitor, decisions, vision
 from .fileio import JsonlRows, append_jsonl, read_json, read_jsonl, write_json
 from .hardware import estimate_memory_gb
 from .metrics import score_predictions
+from .overlap import find_overlaps
 from .prompts import FALLBACK_CHAT_TEMPLATE, build_messages, format_output, render_chat, tokenize_example
 from .train_data import LazyFeatures, measure_lengths, select_within
 
@@ -233,6 +234,13 @@ def run_training(run_dir, status):
 	system_prompt = spec["system_prompt"]
 	events_path = run_dir / "events.jsonl"
 
+	if eval_rows:
+		status.update(state="running", stage="Checking held-out examples for near-copies")
+		overlap = find_overlaps(eval_rows, train_rows)
+		write_json(run_dir / "overlap.json", overlap)
+		if overlap["count"]:
+			log(f"{overlap['count']} held-out example(s) nearly repeat a training example; scores on them may be optimistic (overlap.json).")
+
 	status.update(state="running", stage="Loading PyTorch")
 	import torch
 	plan = Plan(spec, torch)
@@ -255,7 +263,40 @@ def run_training(run_dir, status):
 	tokenizer.padding_side = "right"
 
 	max_len = int(t.get("max_seq_length") or 0)
-	if plan.vision:
+	if plan.decisions:
+		# One sequence per (example, question); options are reshuffled every time a sequence is drawn.
+		progress = lambda done, total: status.update(stage=f"Measuring examples ({done:,} of {total:,})")
+		images_dir = run_dir / "images"
+		if plan.vision:
+			status.update(stage="Preparing images")
+			items, measured = decision_engine.vision_training_items(train_rows, processor, spec, images_dir, progress, log)
+			eval_items, eval_measured = decision_engine.vision_training_items(eval_rows, processor, spec, images_dir, lambda done, total: None, log)
+		else:
+			items, measured = decision_engine.training_items(train_rows, tokenizer, spec, progress)
+			eval_items, eval_measured = decision_engine.training_items(eval_rows, tokenizer, spec, lambda done, total: None)
+		keep, skipped = select_within(measured, max_len)
+		eval_keep, eval_skipped = select_within(eval_measured, max_len)
+		if skipped or eval_skipped:
+			ids = sorted({train_rows[items[i][0]]["id"] for i in skipped} | {eval_rows[eval_items[i][0]]["id"] for i in eval_skipped})
+			write_json(run_dir / "skipped.json", {"max_length": max_len, "ids": ids})
+			log(f"Skipped {len(ids)} example(s) with a question longer than {max_len} tokens; their ids are in skipped.json.")
+		# Runs from before the listwise loss existed have no decision_loss and resume with the token loss.
+		listwise = t.get("decision_loss", "token") == "listwise"
+		seed = int(t.get("seed") or 42)
+		train_items, held_items = [items[i] for i in keep], [eval_items[i] for i in eval_keep]
+		if plan.vision:
+			train_features = decision_engine.VisionDecisionFeatures(train_rows, train_items, processor, spec, images_dir, seed, listwise)
+			eval_features = list(decision_engine.VisionDecisionFeatures(eval_rows, held_items, processor, spec, images_dir, listwise=listwise))
+			base_collator = vision.VisionCollator(processor, model)
+		else:
+			train_features = decision_engine.DecisionFeatures(train_rows, train_items, tokenizer, spec, seed, listwise)
+			eval_features = list(decision_engine.DecisionFeatures(eval_rows, held_items, tokenizer, spec, listwise=listwise))
+			base_collator = PadCollator(tokenizer.pad_token_id, 8 if plan.cuda else None)
+		collator = decision_engine.DecisionCollator(base_collator)
+		lengths = [measured[i] for i in keep] + [eval_measured[i] for i in eval_keep]
+		answer_tokens = 8
+		log(f"{len(spec['questions'])} question(s): " + ", ".join(f"{q['name']} ({q['type']}, {len(q['options'])} options)" for q in spec["questions"]))
+	elif plan.vision:
 		status.update(stage="Preparing images")
 		images_dir = run_dir / "images"
 		train_features = vision.build_features(processor, system_prompt, list(train_rows), images_dir, log)
@@ -269,23 +310,6 @@ def run_training(run_dir, status):
 				log(f"Skipped {before - len(train_features)} training example(s) longer than {max_len} tokens.")
 		lengths = [feature_length(f) for f in train_features + eval_features]
 		answer_tokens = max(len(tokenizer(format_output(r["output"]), add_special_tokens=False)["input_ids"]) for r in list(train_rows) + eval_rows)
-	elif plan.decisions:
-		# One sequence per (example, question); options are reshuffled every time a sequence is drawn.
-		items, measured = decision_engine.training_items(train_rows, tokenizer, spec,
-			lambda done, total: status.update(stage=f"Measuring examples ({done:,} of {total:,})"))
-		keep, skipped = select_within(measured, max_len)
-		eval_items, eval_measured = decision_engine.training_items(eval_rows, tokenizer, spec, lambda done, total: None)
-		eval_keep, eval_skipped = select_within(eval_measured, max_len)
-		if skipped or eval_skipped:
-			ids = sorted({train_rows[items[i][0]]["id"] for i in skipped} | {eval_rows[eval_items[i][0]]["id"] for i in eval_skipped})
-			write_json(run_dir / "skipped.json", {"max_length": max_len, "ids": ids})
-			log(f"Skipped {len(ids)} example(s) with a question longer than {max_len} tokens; their ids are in skipped.json.")
-		train_features = decision_engine.DecisionFeatures(train_rows, [items[i] for i in keep], tokenizer, spec, int(t.get("seed") or 42))
-		eval_features = list(decision_engine.DecisionFeatures(eval_rows, [eval_items[i] for i in eval_keep], tokenizer, spec))
-		collator = PadCollator(tokenizer.pad_token_id, 8 if plan.cuda else None)
-		lengths = [measured[i] for i in keep] + [eval_measured[i] for i in eval_keep]
-		answer_tokens = 8
-		log(f"{len(spec['questions'])} question(s): " + ", ".join(f"{q['name']} ({q['type']}, {len(q['options'])} options)" for q in spec["questions"]))
 	else:
 		measured = measure_lengths(tokenizer, system_prompt, train_rows, 500,
 			lambda done, total: status.update(stage=f"Measuring examples ({done:,} of {total:,})"))
@@ -375,7 +399,9 @@ def run_training(run_dir, status):
 	kl_weight = float(t.get("kl_weight") or 0) if plan.decisions else 0.0
 	if kl_weight > 0:
 		log(f"KL anchor to the base model, weight {kl_weight}")
-	trainer = (decision_engine.anchored_trainer(Trainer, kl_weight) if kl_weight > 0 else Trainer)(
+	if plan.decisions and listwise:
+		log("Listwise loss over each question's options")
+	trainer = (decision_engine.decision_trainer(Trainer, kl_weight, listwise) if plan.decisions else Trainer)(
 		model=model,
 		args=args,
 		train_dataset=train_features,
@@ -414,9 +440,13 @@ def run_training(run_dir, status):
 	max_new = min(4096, int(answer_tokens * 1.5) + 32)
 	log(f"Evaluating on {len(rows)} {eval_on}")
 	if plan.decisions:
-		evaluation = decision_engine.evaluate(model, tokenizer, spec, rows, log)
+		reader = decision_engine.make_reader(model, processor, spec)
+		evaluation = decision_engine.evaluate(reader, spec, rows, log, run_dir / "images")
 		report = evaluation["decisions"]
-		write_json(run_dir / "calibration.json", {"temperature": report["temperature"], "fitted": report["calibrated"], "count": report["count"]})
+		if t.get("compare_generation"):
+			report["generation_baseline"] = decision_engine.generation_baseline(model, processor, spec, rows, run_dir / "images", torch, log)
+		labels = decision_monitor.label_counts(train_rows, spec["questions"])
+		write_json(run_dir / "calibration.json", decision_engine.calibration_file(report, labels))
 		base = f" (base model {report['baseline']['accuracy']:.0%})" if report["baseline"] else ""
 		log(
 			f"Accuracy {report['accuracy']:.0%}{base}  ECE {report['ece']:.3f}, "

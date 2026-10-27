@@ -29,7 +29,7 @@ export async function pollRun() {
 }
 
 // Example validity depends on the schema and on the input kind (image projects require an image).
-const checksKey = (config) => `${config.input_kind}\n${JSON.stringify(config.schema)}`;
+export const checksKey = (config) => `${config.input_kind}\n${JSON.stringify(config.schema)}`;
 
 export const pageSize = () => (S.config && S.config.input_kind === "image" ? 48 : 20);
 

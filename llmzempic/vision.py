@@ -5,6 +5,7 @@ adapter so evaluation, Try it and export all see the resolution the model was tr
 """
 
 import inspect
+import io
 from pathlib import Path
 
 from .prompts import format_output
@@ -19,10 +20,13 @@ def is_vision(spec):
 	return spec.get("input_kind") == "image"
 
 
-def load_image(path):
+def load_image(source):
+	"""An RGB image from a file path, raw bytes, or an already open PIL image."""
 	from PIL import Image, ImageOps
 
-	with Image.open(path) as image:
+	if isinstance(source, Image.Image):
+		return ImageOps.exif_transpose(source).convert("RGB")
+	with Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source) as image:
 		# Phone photos store their rotation in EXIF; browsers apply it, PIL doesn't.
 		return ImageOps.exif_transpose(image).convert("RGB")
 
@@ -94,22 +98,33 @@ def render(processor, messages, add_generation_prompt):
 		return processor.apply_chat_template(rest, add_generation_prompt=add_generation_prompt, tokenize=False)
 
 
+def example_feature(processor, system_prompt, text, answer, path):
+	"""(feature, token ids of the whole example, whether the prompt tokenizes the same inside it). The
+	feature is the chat text plus the prompt length; the collator processes the image per batch."""
+	image = load_image(path)
+	prompt = render(processor, build_messages(system_prompt, text), True)
+	full = render(processor, build_messages(system_prompt, text, answer), False)
+	if not full.startswith(prompt):
+		full = prompt + answer + (processor.tokenizer.eos_token or "")
+	prompt_ids = processor(text=[prompt], images=[[image]], return_tensors="pt")["input_ids"][0]
+	full_ids = processor(text=[full], images=[[image]], return_tensors="pt")["input_ids"][0]
+	aligned = bool((full_ids[:len(prompt_ids)] == prompt_ids).all())
+	feature = {"text": full, "image": str(path), "prompt_len": len(prompt_ids), "length": len(full_ids)}
+	return feature, full_ids.tolist(), aligned
+
+
+MISALIGNED = "WARNING: the chat template tokenizes the prompt differently inside the full example; the loss mask may be off by a few tokens."
+
+
 def build_features(processor, system_prompt, rows, images_dir, log):
 	"""Chat text plus the prompt length per example; the collator processes the images per batch."""
 	features, warned = [], False
 	for row in rows:
-		path = Path(images_dir) / row["image"]
-		image = load_image(path)
-		prompt = render(processor, build_messages(system_prompt, row.get("input") or ""), True)
-		full = render(processor, build_messages(system_prompt, row.get("input") or "", format_output(row["output"])), False)
-		if not full.startswith(prompt):
-			full = prompt + format_output(row["output"]) + (processor.tokenizer.eos_token or "")
-		prompt_ids = processor(text=[prompt], images=[[image]], return_tensors="pt")["input_ids"][0]
-		full_ids = processor(text=[full], images=[[image]], return_tensors="pt")["input_ids"][0]
-		if not warned and not bool((full_ids[:len(prompt_ids)] == prompt_ids).all()):
-			log("WARNING: the chat template tokenizes the prompt differently inside the full example; the loss mask may be off by a few tokens.")
+		feature, _, aligned = example_feature(processor, system_prompt, row.get("input") or "", format_output(row["output"]), Path(images_dir) / row["image"])
+		if not warned and not aligned:
+			log(MISALIGNED)
 			warned = True
-		features.append({"text": full, "image": str(path), "prompt_len": len(prompt_ids), "length": len(full_ids)})
+		features.append(feature)
 	return features
 
 

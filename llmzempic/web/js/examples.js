@@ -4,6 +4,7 @@ import { addExamples, deleteExamples, reloadExamples } from "./example-ops.js";
 import { progressDialog, saver, toast, toastError } from "./feedback.js";
 import { bytes, labelText, plural } from "./format.js";
 import { gallery, selectAllToggle, selectionBar, toggleSelect } from "./gallery.js";
+import { hubImportDialog, synthesizeDialog } from "./assist.js";
 import { healthPanel } from "./health.js";
 import { openIntake, pickImages } from "./intake.js";
 import { outputForm } from "./output-form.js";
@@ -162,6 +163,8 @@ function header() {
 		h("div", { class: "row" },
 			menu(button("Import / export", { icon: "folder", kind: "secondary" }), [
 				...Object.entries(IMPORT_MODES).map(([mode, text]) => ({ label: `Import a file: ${text.toLowerCase()}`, icon: "upload", onclick: () => importFile(mode) })),
+				image ? null : { label: "Import from Hugging Face…", icon: "database", onclick: hubImportDialog },
+				image ? null : { label: "Generate examples with an LLM…", icon: "layers", onclick: synthesizeDialog },
 				"-",
 				{ label: "Download as JSONL", icon: "download", disabled: !S.counts.all, onclick: downloadJsonl },
 			]),

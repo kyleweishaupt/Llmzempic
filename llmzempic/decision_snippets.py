@@ -134,3 +134,92 @@ def all_decision_snippets(name, questions, run_dir="<run folder>"):
 		"csharp": csharp_client(name, questions),
 		"curl": curl_snippet(name, questions, run_dir),
 	}
+
+
+VLLM_CLIENT = '''"""Decisions for __NAME__ from a vLLM server, or any OpenAI-compatible completions server that returns prompt
+log-probabilities with echo. Exact: each option number is scored as part of the prompt, so no text is generated.
+
+	vllm serve <export folder>/merged --served-model-name __NAME__
+	vllm serve __BASE__ --enable-lora --lora-modules __NAME__=<export folder>/adapter
+"""
+
+import json
+import math
+import urllib.request
+
+BASE_URL = "http://localhost:8000"
+MODEL = "__NAME__"
+CONTRACT = json.loads(__CONTRACT__)
+
+
+def _post(url, body):
+	request = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
+	with urllib.request.urlopen(request, timeout=120) as response:
+		return json.load(response)
+
+
+def _prompt(question, text):
+	template = CONTRACT["prompt_template"]
+	head, _, tail = question["prompt"].partition("{input}")
+	return template["before"] + head + text + tail + template["after"]
+
+
+def _answer(question, scores, min_confidence):
+	t = CONTRACT["temperature"]
+	top = max(s / t for s in scores)
+	exps = [math.exp(s / t - top) for s in scores]
+	probs = [e / sum(exps) for e in exps]
+	best = max(range(len(probs)), key=probs.__getitem__)
+	refused = min_confidence is not None and probs[best] < min_confidence
+	answer = {"name": question["name"], "type": question["type"], "confidence": round(probs[best], 4)}
+	if question["type"] == "predicate":
+		answer["probability"] = round(probs[0], 4)
+	else:
+		labels = question.get("choices") or question.get("levels")
+		if question["type"] == "choice":
+			answer["choice"] = None if refused else labels[best]
+		else:
+			answer["score"] = None if refused else round(sum(p * (i + 1) for i, p in enumerate(probs)), 4)
+			answer["level"] = None if refused else labels[best]
+		answer["probabilities"] = {label: round(p, 4) for label, p in zip(labels, probs)}
+	if refused:
+		answer["refused"] = True
+	return answer
+
+
+def decide(text, names=None, min_confidence=None, base_url=BASE_URL, model=MODEL):
+	"""Answers keyed by question name, like the Decisions API. min_confidence "auto" uses each question's
+	threshold for 90% held-out accuracy."""
+	answers = {}
+	for question in CONTRACT["questions"]:
+		if names and question["name"] not in names:
+			continue
+		prompt = _prompt(question, text)
+		# The template's answer prefix (a space for some models) comes before every number. It's scored
+		# with the number: as its own token it adds the same to every option, merged into the number it must count.
+		numbers = [CONTRACT["prompt_template"].get("answer_prefix", "") + n for n in question["numbers"]]
+		body = {"model": model, "prompt": [prompt + n for n in numbers], "max_tokens": 1, "temperature": 0, "echo": True, "logprobs": 1}
+		scores = [0.0] * len(numbers)
+		for choice in _post(base_url.rstrip("/") + "/v1/completions", body)["choices"]:
+			i = choice["index"]
+			logprobs = choice["logprobs"]
+			end = len(prompt) + len(numbers[i])
+			scores[i] = sum(lp for lp, at in zip(logprobs["token_logprobs"], logprobs["text_offset"]) if lp is not None and len(prompt) <= at < end)
+		threshold = question.get("auto_min_confidence") if min_confidence == "auto" else min_confidence
+		answers[question["name"]] = _answer(question, scores, threshold)
+	return answers
+
+
+if __name__ == "__main__":
+	import sys
+
+	print(json.dumps(decide(" ".join(sys.argv[1:]) or "Text to decide on"), indent=2))
+'''
+
+
+def vllm_client(contract):
+	"""A dependency-free Python client that reads a decision model's probabilities from vLLM."""
+	return (
+		VLLM_CLIENT.replace("__NAME__", contract["name"]).replace("__BASE__", contract["base_model"])
+		.replace("__CONTRACT__", repr(json.dumps(contract, ensure_ascii=False)))
+	)

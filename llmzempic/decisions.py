@@ -9,7 +9,10 @@ option numbers (no generation). Numbers scale to hundreds of options where lette
 Pure Python: the UI server, the API request checks and the metrics run without PyTorch.
 """
 
+import base64
+import binascii
 import math
+import random
 import time
 import uuid
 
@@ -24,10 +27,16 @@ TYPE_ALIASES = {
 MAX_OPTIONS = 255
 MAX_LEVELS = 10
 MAX_QUESTIONS = 32
+MAX_SAMPLES = 8
 MAX_INPUT_CHARS = 200_000
 YES_NO = ["Yes", "No"]
 # Below this many scored answers a fitted temperature mostly fits noise; answers stay uncalibrated.
 MIN_CALIBRATION = 50
+# Share of training sequences that show a choice question with only some of its options (the gold one
+# always among them), so the model also answers well when a request lists fewer choices.
+SUBSET_SHARE = 0.25
+# Accuracy that min_confidence "auto" aims for, per question, from the held-out precision curve.
+DEFAULT_TARGET = 0.9
 
 DECISION_HEADER = "You answer one question about the input at a time. Reply with only the number of the best option."
 
@@ -112,23 +121,62 @@ def system_prompt(instructions=""):
 	return "\n\n".join(p for p in ((instructions or "").strip(), DECISION_HEADER) if p)
 
 
-def user_prompt(state, question, order=None):
-	"""The question about the input, its options numbered in display order (order[pos] = option index)."""
+def user_prompt(state, question, order=None, image=False):
+	"""The question about the input, its options numbered in display order (order[pos] = option index; an
+	order may list only some of the options). With image, the input is the image in the same message, with
+	state as its optional text."""
 	labels = option_labels(question)
 	order = order or list(range(len(labels)))
-	ids = option_ids(len(labels))
+	ids = option_ids(len(order))
 	lines = "\n".join(f"{ids[pos]}. {labels[i]}" for pos, i in enumerate(order))
 	header = "Levels, from lowest to highest:" if question["type"] == "score" else "Options:"
-	return f"Input:\n{state}\n\nQuestion: {question_text(question)}\n{header}\n{lines}\n\nAnswer with the number of one option."
+	if image:
+		text = (state or "").strip()
+		subject = f"Input: the image, with this text:\n{text}" if text else "Input: the image."
+	else:
+		subject = f"Input:\n{state}"
+	return f"{subject}\n\nQuestion: {question_text(question)}\n{header}\n{lines}\n\nAnswer with the number of one option."
 
 
-def shuffled_order(question, rng=None):
+def shuffled_order(question, rng=None, gold=None, subset_share=0.0):
 	"""Choice options are shown in a random order during training so the model reads the list instead of
-	memorizing positions; scores keep their order and predicates their Yes/No."""
+	memorizing positions, and sometimes only some of them (always with the gold one); scores keep their
+	order and predicates their Yes/No."""
 	order = list(range(len(question["options"])))
-	if rng is not None and question["type"] == "choice":
-		rng.shuffle(order)
+	if rng is None or question["type"] != "choice":
+		return order
+	rng.shuffle(order)
+	if gold is not None and len(order) > 2 and rng.random() < subset_share:
+		kept = {gold, *[i for i in order if i != gold][:rng.randint(1, len(order) - 2)]}
+		order = [i for i in order if i in kept]
 	return order
+
+
+def sample_orders(question, samples):
+	"""Option orders to read a question in: as listed, then (choice questions, samples > 1) shuffled the
+	same way for every request, so a repeated request gets the same answer."""
+	identity = list(range(len(question["options"])))
+	if samples <= 1 or question["type"] != "choice":
+		return [identity]
+	rng = random.Random(f"{question['name']}:{len(identity)}")
+	orders, seen = [identity], {tuple(identity)}
+	for _ in range(samples * 4):
+		if len(orders) >= samples:
+			break
+		order = identity[:]
+		rng.shuffle(order)
+		if tuple(order) not in seen:
+			seen.add(tuple(order))
+			orders.append(order)
+	return orders
+
+
+def combine_samples(score_sets):
+	"""One log-probability per option from reads in several orders: the log of their mean probability."""
+	if len(score_sets) == 1:
+		return list(score_sets[0])
+	probs = [softmax(s) for s in score_sets]
+	return [math.log(max(sum(p[i] for p in probs) / len(probs), 1e-30)) for i in range(len(probs[0]))]
 
 
 def gold_index(question, value):
@@ -153,7 +201,7 @@ def gold_items(output, questions):
 
 
 def answer_id(question, gold, order):
-	return option_ids(len(question["options"]))[order.index(gold)]
+	return option_ids(len(order))[order.index(gold)]
 
 
 def api_question(question):
@@ -166,10 +214,61 @@ def api_question(question):
 	return out
 
 
+def questions_schema(questions):
+	"""The output schema a list of questions answers: an option list per choice or score, yes/no per predicate."""
+	properties = {}
+	for q in questions:
+		prop = {"type": "boolean"} if q["type"] == "predicate" else {"type": "string", "enum": list(q["options"])}
+		if q["type"] == "score":
+			prop[SCORE_KEY] = True
+		if q.get("instructions"):
+			prop["description"] = q["instructions"]
+		properties[q["name"]] = prop
+	return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+
+
+def summarize_at(samples, temperature):
+	"""Metrics of samples read at a fixed temperature (the one a run serves with)."""
+	return {"temperature": temperature, **summarize([_sample_stats(softmax(s["scores"], temperature), s["gold"]) for s in samples])}
+
+
+def from_api_question(item):
+	"""A question as decisions.json / the API lists it, back in the internal shape."""
+	kind = item["type"]
+	options = [True, False] if kind == "predicate" else list(item["choices"] if kind == "choice" else item["levels"])
+	return {"name": item["name"], "type": kind, "instructions": item.get("instructions") or "", "options": options}
+
+
 # API requests
 
-def _messages_text(messages):
-	lines = []
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def decode_image(part):
+	"""Image bytes from a content part: OpenAI image_url / input_image or an Ollama-style base64 string.
+	Only data URLs and plain base64 are read; the server never fetches URLs or opens local files."""
+	value = part.get("image_url") if part.get("image_url") is not None else part.get("image")
+	if isinstance(value, dict):
+		value = value.get("url")
+	if not isinstance(value, str) or not value:
+		raise DecisionError("An image part needs a base64 data URL.")
+	if value.startswith(("http://", "https://")):
+		raise DecisionError("Send images as base64 data URLs; image links aren't fetched.")
+	if value.startswith("data:"):
+		header, _, value = value.partition(",")
+		if ";base64" not in header:
+			raise DecisionError("Image data URLs must be base64 encoded.")
+	try:
+		data = base64.b64decode(value, validate=True)
+	except (binascii.Error, ValueError):
+		raise DecisionError("The image isn't valid base64.")
+	if not data or len(data) > MAX_IMAGE_BYTES:
+		raise DecisionError(f"Images must be 1 byte to {MAX_IMAGE_BYTES // (1024 * 1024)} MB.")
+	return data
+
+
+def _messages_input(messages):
+	lines, images = [], []
 	for m in messages:
 		content = m.get("content")
 		if isinstance(content, list):
@@ -179,30 +278,45 @@ def _messages_text(messages):
 				if kind in ("text", "input_text"):
 					parts.append(str(part.get("text") or ""))
 				elif kind in ("image", "image_url", "input_image"):
-					raise DecisionError("This decision model reads text only; images in the input aren't supported yet.")
+					images.append(decode_image(part))
 				else:
-					raise DecisionError("Message content parts must be text.")
-			content = "\n".join(parts)
+					raise DecisionError("Message content parts must be text or images.")
+			content = "\n".join(p for p in parts if p)
 		elif not isinstance(content, str):
 			content = compact_json(content)
-		lines.append(f"{m['role']}: {content}")
-	return "\n".join(lines)
+		for image in m.get("images") or ():  # Ollama-style messages
+			images.append(decode_image({"image": image}))
+		if content:
+			lines.append(f"{m['role']}: {content}")
+	return "\n".join(lines), images
 
 
-def state_text(value):
-	"""The input as text: a string as is, chat messages as "role: content" lines, other JSON compactly."""
+def parse_input(value):
+	"""(text, image bytes or None): a string as is, chat messages as "role: content" lines plus their image,
+	other JSON compactly. Decision models read one image per input."""
 	if value is None:
 		raise DecisionError('Add an "input" to decide on.')
+	images = []
 	if isinstance(value, str):
 		text = value
 	elif isinstance(value, list) and value and all(isinstance(m, dict) and "role" in m for m in value):
-		text = _messages_text(value)
+		text, images = _messages_input(value)
 	else:
 		text = compact_json(value)
-	if not text.strip():
+	if len(images) > 1:
+		raise DecisionError("Send one image per input.")
+	if not text.strip() and not images:
 		raise DecisionError("The input is empty.")
 	if len(text) > MAX_INPUT_CHARS:
 		raise DecisionError(f"The input is longer than {MAX_INPUT_CHARS:,} characters.")
+	return text, images[0] if images else None
+
+
+def state_text(value):
+	"""The input as text, for models that read text only."""
+	text, image = parse_input(value)
+	if image is not None:
+		raise DecisionError("This decision model reads text only; images in the input aren't supported.")
 	return text
 
 
@@ -242,17 +356,41 @@ def parse_question(item, index, known):
 		options = _option_list(item, "choices", kind, name) if "choices" in item or not same_kind else list(base["options"])
 	else:
 		options = _option_list(item, "levels", kind, name) if "levels" in item or not same_kind else list(base["options"])
-	# The model was trained on this question (its options at least): its calibration applies.
-	trained = bool(same_kind and base["options"] == options)
+	# The model was trained on this question and these options (or some of them, as it also trains on option
+	# subsets): its calibration applies.
+	trained = bool(same_kind and (base["options"] == options or (kind == "choice" and set(options) <= set(base["options"]))))
 	return {"name": name, "type": kind, "instructions": instructions.strip(), "options": options, "trained": trained}
 
 
+def _fraction(body, key):
+	value = body.get(key)
+	if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1):
+		raise DecisionError(f'"{key}" must be a number from 0 to 1.')
+	return value
+
+
+def parse_settings(body):
+	"""Answer settings of a request: refusal threshold (a number, or "auto" for the per-question threshold
+	that reached target_accuracy on held-out examples) and samples (option orders read per choice question)."""
+	threshold = body.get("min_confidence")
+	if threshold != "auto":
+		threshold = _fraction(body, "min_confidence")
+	target = _fraction(body, "target_accuracy")
+	if target is not None and threshold is None:
+		threshold = "auto"
+	samples = body.get("samples", 1)
+	if isinstance(samples, bool) or not isinstance(samples, int) or not 1 <= samples <= MAX_SAMPLES:
+		raise DecisionError(f'"samples" must be a whole number from 1 to {MAX_SAMPLES}.')
+	return {"min_confidence": threshold, "target_accuracy": target if target is not None else DEFAULT_TARGET, "samples": samples}
+
+
 def parse_request(body, trained=None):
-	"""(input text, questions, min confidence) from a Decisions API request. Questions may be left out
-	(all trained questions) or name a trained question and leave out the rest of its definition."""
+	"""(input text, questions, settings) from a Decisions API request. Questions may be left out (all
+	trained questions) or name a trained question and leave out the rest of its definition. An image in
+	the input is in settings["image"] (bytes)."""
 	if not isinstance(body, dict):
 		raise DecisionError("The request body must be a JSON object.")
-	state = state_text(body.get("input"))
+	state, image = parse_input(body.get("input"))
 	known = {q["name"]: q for q in trained or []}
 	raw = body.get("questions")
 	if raw is None:
@@ -266,10 +404,7 @@ def parse_request(body, trained=None):
 	questions = [parse_question(item, i, known) for i, item in enumerate(raw)]
 	if len({q["name"] for q in questions}) != len(questions):
 		raise DecisionError("Question names must be different.")
-	threshold = body.get("min_confidence")
-	if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 <= threshold <= 1):
-		raise DecisionError('"min_confidence" must be a number from 0 to 1.')
-	return state, questions, threshold
+	return state, questions, {**parse_settings(body), "image": image}
 
 
 # Answers
@@ -321,9 +456,30 @@ def question_temperature(question, temperature):
 	return temperature if question.get("trained", True) else 1.0
 
 
-def build_response(model, questions, scores, input_tokens, temperature=1.0, threshold=None):
+def question_threshold(question, settings, curves=None):
+	"""The confidence below which this question's answer is refused, or None."""
+	threshold = (settings or {}).get("min_confidence")
+	if threshold != "auto":
+		return threshold
+	curve = (curves or {}).get(question["name"]) if question.get("trained", True) else None
+	return auto_threshold(curve, settings.get("target_accuracy") or DEFAULT_TARGET) if curve else None
+
+
+def usage_of(usage):
+	usage = usage if isinstance(usage, dict) else {"input_tokens": usage}
+	out = {"input_tokens": int(usage.get("input_tokens") or 0), "output_tokens": 0}
+	if usage.get("cached_tokens"):
+		out["input_tokens_details"] = {"cached_tokens": int(usage["cached_tokens"])}
+	return out
+
+
+def build_response(model, questions, scores, usage, temperature=1.0, settings=None, curves=None):
+	"""scores: one log-probability per option per question. settings: parse_settings() of the request (or
+	a plain min_confidence number); curves: per-question precision curves for "auto" thresholds."""
+	if not isinstance(settings, dict):
+		settings = {"min_confidence": settings}
 	answers = [
-		build_answer(q, softmax(s, question_temperature(q, temperature)), threshold)
+		build_answer(q, softmax(s, question_temperature(q, temperature)), question_threshold(q, settings, curves))
 		for q, s in zip(questions, scores)
 	]
 	return {
@@ -332,7 +488,7 @@ def build_response(model, questions, scores, input_tokens, temperature=1.0, thre
 		"created": int(time.time()),
 		"model": model,
 		"answers": answers,
-		"usage": {"input_tokens": int(input_tokens), "output_tokens": 0},
+		"usage": usage_of(usage),
 	}
 
 
@@ -389,6 +545,33 @@ def fit_temperature(samples):
 	return round(min(fine, key=lambda t: mean_nll(samples, t)), 4)
 
 
+def precision_curve(confidences, correct, points=40):
+	"""[[threshold, precision, coverage]] for answers at least that confident, highest threshold first."""
+	pairs = sorted(zip(confidences, correct), reverse=True)
+	n = len(pairs)
+	if not n:
+		return []
+	step = max(1, n // points)
+	curve, hits = [], 0
+	for i, (conf, ok) in enumerate(pairs, start=1):
+		hits += 1 if ok else 0
+		last = i == n or pairs[i][0] < conf
+		if last and (i % step == 0 or i == n or i <= 3):
+			# Rounded down, so every answer counted at a threshold is at least that confident.
+			curve.append([math.floor(conf * 10_000) / 10_000, round(hits / i, 4), round(i / n, 4)])
+	return curve
+
+
+def auto_threshold(curve, target):
+	"""Lowest threshold whose answers were at least target accurate on held-out examples (most answers kept),
+	1.0 (refuse everything) when no threshold reached it."""
+	best = None
+	for threshold, precision, _ in curve:
+		if precision >= target:
+			best = threshold
+	return 1.0 if best is None else best
+
+
 def calibration_report(samples, questions):
 	"""samples: [{"question": index, "scores": [log-score per option], "gold": option index}].
 
@@ -415,6 +598,14 @@ def calibration_report(samples, questions):
 			continue
 		# Temperature never changes the top answer, so accuracy is the same before and after.
 		row = {"name": q["name"], "type": q["type"], **summarize([calibrated[i] for i in idx])}
+		served = [_sample_stats(softmax(samples[i]["scores"], temperature), samples[i]["gold"]) for i in idx]
+		row["curve"] = precision_curve([s["confidence"] for s in served], [s["correct"] for s in served])
+		threshold = auto_threshold(row["curve"], DEFAULT_TARGET)
+		kept = [s for s in served if s["confidence"] >= threshold]
+		row["auto"] = {
+			"target": DEFAULT_TARGET, "min_confidence": threshold, "coverage": round(len(kept) / len(served), 4),
+			"accuracy": round(sum(1 for s in kept if s["correct"]) / len(kept), 4) if kept else None,
+		}
 		if q["type"] == "score":
 			levels = range(1, len(q["options"]) + 1)
 			errors = [abs(sum(p * k for p, k in zip(softmax(samples[i]["scores"], temperature), levels)) - (samples[i]["gold"] + 1)) for i in idx]

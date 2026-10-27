@@ -182,9 +182,12 @@ def test_import_and_infer_schema(env):
 
 def test_settings_never_return_token(env):
 	client, _, _ = env
-	client.put("/api/settings", json={"hf_token": "hf_secret", "llama_cpp_dir": "/opt/llama.cpp"})
+	client.put("/api/settings", json={"hf_token": "hf_secret", "llama_cpp_dir": "/opt/llama.cpp", "generator_key": "sk-secret"})
 	data = client.get("/api/settings").json()
-	assert data == {"hf_token_set": True, "llama_cpp_dir": "/opt/llama.cpp"}
+	assert data == {
+		"hf_token_set": True, "llama_cpp_dir": "/opt/llama.cpp",
+		"generator_url": "http://localhost:11434/v1", "generator_model": "", "generator_key_set": True,
+	}
 
 
 def test_unknown_ids_are_rejected(env):

@@ -5,6 +5,7 @@ import { toastError } from "./feedback.js";
 import { duration, plural, when } from "./format.js";
 import { evaluationView, metricTiles } from "./evaluation.js";
 import { loadRuns, selectRun } from "./project.js";
+import { monitorCard } from "./monitor.js";
 import { tryPanel } from "./try.js";
 import { S, app } from "./state.js";
 
@@ -63,6 +64,15 @@ async function resume(run, btn) {
 	}
 }
 
+function overlapNote(run) {
+	if (!run.overlap) return null;
+	return h("details", { class: "card card-pad skipped" },
+		h("summary", {}, icon("alert"), `${plural(run.overlap, "held-out example")} nearly repeat a training example`),
+		h("p", { class: "muted small" }, "Scores on near-copies of training inputs look better than the model is. Remove or reword one side of each pair."),
+		h("div", { class: "row wrap" }, (run.overlap_pairs || []).map((p) => h("code", { class: "small", title: `${Math.round(p.similarity * 100)}% the same` }, `${p.held_out} ≈ ${p.train}`))),
+	);
+}
+
 function skippedNote(run) {
 	const s = run.skipped_examples;
 	if (!run.skipped || !s) return null;
@@ -100,8 +110,10 @@ export function renderRunDetail(el) {
 		running ? progress(st) : null,
 		st.error ? callout("bad", "alert-circle", h("b", {}, "Training failed. "), st.error) : null,
 		skippedNote(run),
+		overlapNote(run),
 		chart ? h("section", { class: "card card-pad" }, chart) : null,
 		run.evaluation ? evaluationView(run.evaluation) : run.metrics ? metricTiles(run.metrics) : null,
+		st.state === "completed" && run.monitored ? monitorCard(run) : null,
 		st.state === "completed" ? tryPanel(run) : null,
 		st.state === "completed" ? h("div", { class: "export-cta" },
 			h("div", {}, h("b", {}, "Happy with the results?"), h("p", { class: "muted small" }, "Export a GGUF model and client code for your apps.")),

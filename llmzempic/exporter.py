@@ -26,7 +26,7 @@ from pathlib import Path
 
 from . import decisions, vision
 from .datasets import run_resolver
-from .decision_snippets import all_decision_snippets, request_body
+from .decision_snippets import all_decision_snippets, request_body, vllm_client
 from .fileio import read_json, read_jsonl, write_json
 from .grammar import values_grammar
 from .refs import export_contract, referenced_ids
@@ -238,7 +238,7 @@ def write_grammar(llama_dir, export_dir):
 	return True
 
 
-def decision_readme(spec, name, gguf_file, metrics):
+def decision_readme(spec, name, gguf_file, metrics, contract, mmproj_file=None):
 	report = (metrics or {}).get("decisions") or {}
 	lines = [
 		f"# {name}: decision model",
@@ -256,70 +256,144 @@ def decision_readme(spec, name, gguf_file, metrics):
 		"",
 		"## Decisions API",
 		"",
-		"Serve the run (base model + LoRA adapter) with Llmzempic and POST `integration/decisions-request.json`:",
+		"This folder has the LoRA adapter (`adapter/`) and calibration, so it serves on any machine that can download",
+		f"`{spec['base_model']}`:",
 		"",
 		"```",
-		'llmzempic serve --run "<run folder>"',
+		'llmzempic serve --run "<this folder>"',
 		"curl http://localhost:7871/v1/decisions -H \"Content-Type: application/json\" -d @integration/decisions-request.json",
 		"```",
 		"",
-		"Every question is read from one batched forward pass: no text is generated, so answers cost input tokens only.",
-		"Leave `questions` out to ask all of them, or name one and leave out the rest of its definition. Clients for",
-		"Python, PHP and C# are in `integration/`.",
+		"The input is read once and every question continues from it: no text is generated, so answers cost input tokens",
+		"only. Leave `questions` out to ask all of them, or name one and leave out the rest of its definition.",
+		'`"min_confidence": "auto"` refuses answers below each question\'s threshold for 90% held-out accuracy',
+		"(`target_accuracy` sets another). Clients for Python, PHP and C# are in `integration/`.",
 	]
+	if contract.get("prompt_template"):
+		lines += [
+			"",
+			"## vLLM",
+			"",
+			f"`integration/{snake(name)}_vllm.py` reads the same probabilities from a vLLM server (exact: it scores each option",
+			"number as part of the prompt with `echo` and `logprobs`). Serve the merged model (export with \"keep merged\"),",
+			"or the base model with this adapter:",
+			"",
+			"```",
+			f"vllm serve {spec['base_model']} --enable-lora --lora-modules {name}=adapter",
+			"```",
+		]
 	if gguf_file:
 		lines += [
 			"",
 			"## GGUF",
 			"",
-			f"`{gguf_file}` answers each question's prompt (`decisions.json` has the system prompt and one user prompt per",
-			"question) with the number of the best option. For probabilities, read the probability of every option number",
+			f"`{gguf_file}`{f' (with `{mmproj_file}`)' if mmproj_file else ''} answers each question's prompt with the number of",
+			"the best option. `decisions.json` has the system prompt, the chat template around the user prompt (and the",
+			"`answer_prefix` it puts before an answer), one user prompt per question and the option numbers. For",
+			"probabilities, read the probability of every option number written after the answer prefix",
 			"(llama-server `n_probs`), normalize over the options and divide the log-probabilities by `temperature`.",
 		]
 	return "\n".join(lines) + "\n"
 
 
-def write_decision_files(export_dir, spec, name, gguf_file, ctx, metrics):
-	"""Decision runs: the questions, prompts and calibration temperature, and Decisions API clients."""
+def prompt_template(adapter_dir, spec):
+	"""The chat template around the user prompt, as text before and after it, so clients that send raw prompts
+	(vLLM completions) build exactly what the model was trained on. None for image runs or on failure."""
+	if vision.is_vision(spec) or not (adapter_dir / "tokenizer_config.json").exists():
+		return None
+	try:
+		from transformers import AutoTokenizer
+
+		from .prompts import FALLBACK_CHAT_TEMPLATE, build_messages, render_chat
+
+		tokenizer = AutoTokenizer.from_pretrained(str(adapter_dir))
+		if not getattr(tokenizer, "chat_template", None):
+			tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
+		mark, answer = "\u241fUSER\u241f", "\u241fANSWER\u241f"
+		prompt = render_chat(tokenizer, build_messages(spec["system_prompt"], mark), True)
+		before, _, after = prompt.partition(mark)
+		# What the template writes between the prompt and the answer (a space for Mistral-style templates):
+		# training learned the number after it, so raw-prompt clients must send it too.
+		full = render_chat(tokenizer, build_messages(spec["system_prompt"], mark, answer), False)
+		lead = full[len(prompt):full.index(answer)] if full.startswith(prompt) and answer in full else ""
+		return {"before": before, "after": after, "answer_prefix": lead} if after or before else None
+	except Exception as e:  # the export is still usable without it
+		log(f"No prompt template for raw-prompt clients: {e}")
+		return None
+
+
+def decision_contract(spec, name, metrics, template=None, curves=None):
+	"""decisions.json: everything a client needs to ask this model's questions and read its answers."""
+	report = (metrics or {}).get("decisions") or {}
+	curves = curves or {}
+	questions = []
+	for q in spec["questions"]:
+		item = decisions.api_question(q)
+		item["prompt"] = decisions.user_prompt("{input}", q, image=vision.is_vision(spec))
+		item["numbers"] = decisions.option_ids(len(q["options"]))
+		if curves.get(q["name"]):
+			item["auto_min_confidence"] = decisions.auto_threshold(curves[q["name"]], decisions.DEFAULT_TARGET)
+		questions.append(item)
+	return {
+		"format": "llmzempic-decisions/1",
+		"name": name,
+		"base_model": spec["base_model"],
+		"input_kind": spec.get("input_kind", "text"),
+		"instructions": spec.get("instructions", ""),
+		"system_prompt": spec["system_prompt"],
+		"prompt_template": template,
+		"questions": questions,
+		"answer": "The number of one option, as listed in the prompt (numbers are zero-padded to one width).",
+		"temperature": report.get("temperature", 1.0),
+		"curves": curves,
+	}
+
+
+def write_decision_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file=None, template=None, curves=None):
+	"""Decision runs: the questions, prompts and calibration, and Decisions API and vLLM clients."""
 	integration = export_dir / "integration"
 	integration.mkdir(parents=True, exist_ok=True)
 	questions = spec["questions"]
-	report = (metrics or {}).get("decisions") or {}
 	(export_dir / "system_prompt.txt").write_text(spec["system_prompt"], encoding="utf-8")
 	if gguf_file:
-		(export_dir / "Modelfile").write_text(modelfile_text(spec, gguf_file, ctx), encoding="utf-8")
-	contract = {
-		"name": name,
-		"questions": [decisions.api_question(q) for q in questions],
-		"system_prompt": spec["system_prompt"],
-		"user_prompts": {q["name"]: decisions.user_prompt("{input}", q) for q in questions},
-		"answer": "The number of one option, as listed in the prompt (numbers are zero-padded to one width).",
-		"temperature": report.get("temperature", 1.0),
-	}
+		(export_dir / "Modelfile").write_text(modelfile_text(spec, gguf_file, ctx, mmproj_file), encoding="utf-8")
+	contract = decision_contract(spec, name, metrics, template, curves)
 	write_json(export_dir / "decisions.json", contract)
 	snippets = all_decision_snippets(name, questions)
 	(integration / f"{snake(name)}_decisions.py").write_text(snippets["python"], encoding="utf-8")
 	(integration / "decisions.php").write_text(snippets["php"], encoding="utf-8")
 	(integration / f"{pascal(name)}Decisions.cs").write_text(snippets["csharp"], encoding="utf-8")
 	(integration / "decisions-request.json").write_text(json.dumps(request_body(name, questions), indent=2, ensure_ascii=False), encoding="utf-8")
-	(export_dir / "README.md").write_text(decision_readme(spec, name, gguf_file, metrics), encoding="utf-8")
+	if template:
+		(integration / f"{snake(name)}_vllm.py").write_text(vllm_client(contract), encoding="utf-8")
+	(export_dir / "README.md").write_text(decision_readme(spec, name, gguf_file, metrics, contract, mmproj_file), encoding="utf-8")
 	write_json(export_dir / "llmzempic.json", {
 		"name": name,
 		"project": spec["project_name"],
 		"base_model": spec["base_model"],
-		"input_kind": "text",
+		"input_kind": spec.get("input_kind", "text"),
 		"answer_mode": "decisions",
 		"gguf": gguf_file,
+		"mmproj": mmproj_file,
 		"context_size": ctx,
-		"decisions": contract,
+		"adapter": "adapter",
+		"decisions": "decisions.json",
 		"metrics": metrics,
 		"exported": time.time(),
 	})
 
 
-def write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file=None, image_tokens=None):
+def copy_decision_model(run_dir, export_dir):
+	"""The LoRA adapter (a few MB) and calibration, so the export folder serves on its own."""
+	shutil.rmtree(export_dir / "adapter", ignore_errors=True)
+	shutil.copytree(run_dir / "adapter", export_dir / "adapter")
+	if (run_dir / "calibration.json").exists():
+		shutil.copyfile(run_dir / "calibration.json", export_dir / "calibration.json")
+
+
+def write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file=None, image_tokens=None, template=None, curves=None):
 	if decisions.is_decision_spec(spec):
-		write_decision_files(export_dir, spec, name, gguf_file, ctx, metrics)
+		write_decision_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file, template, curves)
 		return
 	integration = export_dir / "integration"
 	integration.mkdir(parents=True, exist_ok=True)
@@ -389,7 +463,13 @@ def run_export(run_dir, status):
 
 	for old in export_dir.glob("*.gguf"):
 		old.unlink()
-	write_deploy_files(export_dir, spec, name, None, ctx, metrics)
+	template = curves = None
+	if decisions.is_decision_spec(spec):
+		status.update(stage="Copying the adapter and calibration")
+		copy_decision_model(run_dir, export_dir)
+		template = prompt_template(run_dir / "adapter", spec)
+		curves = (read_json(run_dir / "calibration.json", {}) or {}).get("curves")
+	write_deploy_files(export_dir, spec, name, None, ctx, metrics, template=template, curves=curves)
 	has_refs = bool(referenced_ids(spec["schema"]))
 	if has_refs:
 		status.update(stage="Writing data set lists and grammar")
@@ -429,7 +509,7 @@ def run_export(run_dir, status):
 					f"llama-quantize was not found, so the GGUF is f16. Ollama will quantize it to {gguf_type} "
 					f"with: ollama create {name} --quantize {ollama_quantize} -f Modelfile"
 				)
-		write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file, image_tokens)
+		write_deploy_files(export_dir, spec, name, gguf_file, ctx, metrics, mmproj_file, image_tokens, template, curves)
 		if not has_refs and not decisions.is_decision_spec(spec):
 			status.update(stage="Building grammar")
 			if not write_grammar(llama_dir, export_dir):

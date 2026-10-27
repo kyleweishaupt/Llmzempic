@@ -77,34 +77,46 @@ then `pip install -e .[train,cuda]`.
 ## Decision models
 
 Many apps don't need generated text, just a fast typed decision: route a ticket, rate its urgency, flag
-a policy violation. Choose **Decisions** as the answer on the Task tab and every top-level output field
-becomes a question, phrased by the field's description:
+a policy violation, check a photo. Choose **Decisions** as the answer on the Task tab and every top-level
+output field becomes a question, phrased by the field's description:
 
 - an option list is a **choice** (up to 255 options), or an **ordered score** (a rubric of 2-10 levels;
 	its score is the expected level, for example 2.7 on a 1-4 scale);
 - a yes/no field is a **predicate**: the probability that it's true.
 
-Each question is asked on its own: the prompt numbers the options and the model answers with one number.
-The probability of every option is read from one batched forward pass, so nothing is generated and a
-decision costs input tokens only. Numbers scale to hundreds of options (zero-padded, scored over all of
-their tokens), where letters run out.
+Each question is asked on its own: the prompt numbers the options and the model answers with one number,
+written exactly where the chat template puts the assistant's answer. The probability of every option is
+read from the logits, so nothing is generated and a decision costs input tokens only. Numbers scale to
+hundreds of options (zero-padded, scored over all of their tokens), where letters run out. Every question's
+prompt starts with the system prompt and the input, so that shared prefix is read once and its key/value
+cache reused for each question (text models): the input costs one forward pass however many questions
+are asked. Text, JSON, chat messages and images (vision models: SmolVLM, Qwen3-VL) all work as input.
 
-- **Training** makes one sequence per example and question, reshuffling choice options each time so the
-	model reads the list instead of memorizing positions. A KL anchor (*KL anchor weight* on the Model tab,
-	0.1 by default, 0 turns it off) keeps the model's next-token predictions on the prompt close to the base
-	model's, so learning to decide costs little general ability. Unsloth isn't used for decision models.
-- **Scoring** reports accuracy per question, calibration (expected calibration error, Brier score) and
-	latency, next to the base model reading the same prompts without fine-tuning. With 50 or more held-out
-	answers, a temperature is fitted to calibrate the probabilities (cross-fitted for the scores shown) and
-	applied whenever the run answers. **Try it** shows every option's probability.
-- **Serving**: `llmzempic serve --run <run folder>` keeps the model loaded and answers
+- **Training** makes one sequence per example and question, reshuffling choice options each time (and
+	sometimes showing only some of them) so the model reads the list instead of memorizing positions. The
+	*listwise* loss (default) adds a cross-entropy over each question's options, factorized over the tokens of
+	the option numbers, to the usual token loss. A KL anchor (*KL anchor weight*, 0.1 by default, 0 turns it
+	off) keeps the model's next-token predictions on the prompt close to the base model's, so learning to
+	decide costs little general ability. Unsloth isn't used for decision models.
+- **Scoring** reports accuracy per question, calibration (expected calibration error, Brier score), latency
+	and the output tokens a generated JSON answer would have cost, next to the base model reading the same
+	prompts without fine-tuning (the training-free baseline). *Compare with generated JSON* also scores the
+	base model writing JSON answers, the usual approach. With 50 or more held-out answers a temperature is
+	fitted to calibrate the probabilities (cross-fitted for the scores shown) and applied whenever the run
+	answers. Each question also gets an **auto threshold**: the confidence above which its answers were 90%
+	right. Training warns when held-out inputs nearly repeat training inputs (word-pair similarity of 80% or
+	more), since those make scores look better than the model is. **Try it** shows every option's probability.
+- **Serving**: `llmzempic serve --run <run or export folder>` keeps the model loaded and answers
 	`POST http://localhost:7871/v1/decisions`; `--model <base model>` serves any base model training-free.
-	Requests can leave `questions` out (all trained questions), name a trained question only, or bring new
-	questions (answered, but not calibrated). `min_confidence` withholds less confident answers
-	(`"refused": true`, probabilities still reported). The input can be text, JSON, or chat messages.
+	Requests can leave `questions` out (all trained questions), name a trained question only, list fewer
+	choices, or bring new questions (answered, but not calibrated). `min_confidence` withholds less confident
+	answers (`"refused": true`, probabilities still reported): a number, or `"auto"` for each question's
+	threshold (`target_accuracy` picks another accuracy than 90%). A refused answer is the cue to hand the
+	decision to a bigger model or a person. `samples` (up to 8) also reads choice questions with their options
+	in other orders and averages: more compute for steadier answers.
 
 ```
-{"input": "I was charged twice, refund me!", "min_confidence": 0.6,
+{"input": "I was charged twice, refund me!", "min_confidence": "auto",
  "questions": [{"name": "intent", "type": "choice", "instructions": "What does the customer want?",
                 "choices": ["billing", "technical_support", "sales", "other"]},
                {"name": "urgency", "type": "score", "instructions": "Rate urgency", "levels": ["low", "medium", "high"]},
@@ -113,12 +125,46 @@ their tokens), where letters run out.
 {"answers": [{"name": "intent", "type": "choice", "choice": "billing", "probabilities": {"billing": 0.91, ...}, "confidence": 0.91},
              {"name": "urgency", "type": "score", "score": 2.4, "level": "medium", "probabilities": {...}, "confidence": 0.55},
              {"name": "is_toxic", "type": "predicate", "probability": 0.03, "confidence": 0.97}],
- "usage": {"input_tokens": 412, "output_tokens": 0}}
+ "usage": {"input_tokens": 412, "output_tokens": 0, "input_tokens_details": {"cached_tokens": 236}}}
 ```
 
-Exporting a decision run writes `decisions.json` (questions, prompts, calibration temperature), Python,
-PHP and C# clients for the Decisions API, and the GGUF model, which answers each question's prompt with an
-option number. Decision models read text for now; image projects use JSON answers.
+Images go in chat messages, as OpenAI `image_url` parts with a base64 data URL or Ollama-style `images`.
+
+### In production
+
+- **Several models at once**: repeat `--run`/`--model` (`--run NAME=FOLDER` names one; a request's `model`
+	picks it). Runs on the same base model share its weights and switch LoRA adapters per request.
+	`--ab live=new:90,old:10` adds an A/B route that splits traffic by weight (by a hash of the request's
+	`user`, so a user keeps getting the same model); `--ensemble avg=a,b` averages models' probabilities.
+- **Monitoring**: decisions are logged as JSONL in the run's or export's `serve/` folder (`--log-dir` elsewhere,
+	`--no-log-inputs` to keep inputs out, `--no-log` for none). `POST /v1/feedback {"id": "dec_…", "answers":
+	{"intent": "billing"}}` records the right answers. `GET /v1/stats` and the run's **In production** panel
+	show the answer distribution and its drift from the training labels (PSI above 0.2 is flagged), confidence
+	and refusal rates by day, and accuracy from feedback; decisions with feedback become training examples
+	with one click.
+- **Agents**: `llmzempic mcp --run <folder>` runs the model as an MCP tool server over stdio, with one tool,
+	`decide`, taking the same input as the API.
+- **Benchmarks**: `llmzempic eval <folder> --data test.jsonl` or `--hub mteb/banking77 --split test --label
+	intent=label_text` scores a labeled set: accuracy, calibration at the served temperature, per question, the
+	base model with `--baseline`, and inputs that nearly repeat training data (`--drop-overlap` leaves them out).
+
+### Exports
+
+Exporting a decision run writes `decisions.json` (the questions, the system prompt, the chat template around
+the user prompt, one prompt per question, the option numbers, calibration and thresholds), the LoRA adapter
+and calibration (so `llmzempic serve --run <export folder>` works on any machine), Python, PHP and C# clients
+for the Decisions API, a dependency-free Python client that reads the same probabilities from **vLLM** (each
+option number scored as part of the prompt with `echo` and `logprobs`; serve the merged model or the base
+model with `--enable-lora`), and the GGUF model, which answers each question's prompt with an option number.
+
+### Data for decision models
+
+On the Examples tab, **Import from Hugging Face…** pulls a labeled dataset (any parquet-backed dataset, such
+as `mteb/banking77`) through the Hub's dataset viewer, and can turn its label columns into the output design.
+**Generate examples with an LLM…** has a stronger model (any OpenAI-compatible endpoint set in Settings,
+Ollama by default) write inputs for every value of each option list and yes/no field, a third of them hard
+cases that look like another value; each answer is checked against the schema, and the ids start with
+`syn-`.
 
 ## Data sets
 
@@ -210,9 +256,12 @@ llmzempic ui --port 8000 --no-browser
 llmzempic train <project>         # train without the UI
 llmzempic try <run folder> "text" # answer an input with a trained run
 llmzempic try <run folder> --image photo.jpg   # image runs; repeat --image for more
-llmzempic decide --run <run folder> "text"      # decision runs: probabilities as JSON
+llmzempic decide --run <folder> "text"          # decision runs or exports: probabilities as JSON
+llmzempic decide --run <folder> --image photo.jpg --samples 3 --min-confidence auto
 llmzempic decide --model <base model> --questions questions.json "text"   # training-free
-llmzempic serve --run <run folder> --port 7871  # Decisions API (or --model <base model>)
+llmzempic serve --run <folder> --port 7871       # Decisions API (repeat --run/--model; --ab, --ensemble)
+llmzempic eval <folder> --hub mteb/banking77 --label intent=label_text   # benchmark a decision model
+llmzempic mcp --run <folder>                     # the model as an MCP tool for agents
 llmzempic export <run folder> --gguf q4_k_m --ollama
 llmzempic package <project> --include-run      # save a .llmz package
 llmzempic import-package <file.llmz>
@@ -239,6 +288,8 @@ python -m venv .venv && .venv/bin/python -m pip install -e .[dev]
 Layout: `llmzempic/server.py` plus `*_api.py` routers (API), `web/` (UI: `index.html`, `css/` and
 `js/` ES modules, no build step), `trainer.py`, `vision.py` and `exporter.py` (run in the worker
 process), `decisions.py` (decision questions, prompts, answers and calibration; no PyTorch),
-`decision_engine.py` (option readout, decision training and scoring) and `decision_server.py` (Decisions API), `runs.py`, `workspace.py`, `example_store.py`, `checks.py` and `images.py` (on-disk
+`decision_engine.py` (option readout, decision training and scoring), `decision_server.py` (Decisions API),
+`decision_monitor.py` (decision logs, drift, feedback), `decision_mcp.py` (MCP tool), `hub_import.py`,
+`synthetic.py` and `overlap.py` (labeling helpers and leak checks), `runs.py`, `workspace.py`, `example_store.py`, `checks.py` and `images.py` (on-disk
 projects), `datasets.py` and `refs.py` (data sets), `grammar.py` and `client_checks.py` (exports),
 `packages.py`, `catalog.json` (base model list).

@@ -31,6 +31,8 @@ const TRAINING_FIELDS = [
 	{ key: "accelerator", label: "Accelerator", options: [["auto", "Auto (Unsloth if installed)"], ["unsloth", "Unsloth"], ["off", "Standard PEFT"]], help: "Unsloth is used for text models only." },
 	{ key: "seed", label: "Random seed", step: 1, min: 0 },
 	{ key: "kl_weight", label: "KL anchor weight", step: 0.05, min: 0, decisions: true, help: "Keeps the model's general language close to the base model while it learns to decide. 0 turns it off." },
+	{ key: "compare_generation", label: "Compare with generated JSON", decisions: true, options: [[false, "No"], [true, "Yes (slower scoring)"]], help: "Also scores the base model writing JSON answers, the usual approach, on the held-out examples." },
+	{ key: "decision_loss", label: "Decision loss", decisions: true, options: [["listwise", "Listwise over the options"], ["token", "Answer tokens only"]], help: "Listwise also trains the probabilities across each question's options." },
 ];
 
 function selectModel(id) {
@@ -102,7 +104,7 @@ function presetSection() {
 			? h("select", {}, f.options.map(([v, label]) => h("option", { value: v, selected: v === value }, label)))
 			: h("input", { type: "number", step: f.step, min: f.min, max: f.max, value });
 		control.addEventListener("change", () => {
-			t[f.key] = f.options ? control.value : Math.min(f.max ?? Infinity, Math.max(f.min ?? -Infinity, Number(control.value)));
+			t[f.key] = f.options ? f.options.find(([v]) => String(v) === control.value)[0] : Math.min(f.max ?? Infinity, Math.max(f.min ?? -Infinity, Number(control.value)));
 			if (!f.options) control.value = t[f.key];
 			scheduleConfigSave();
 			mount($("#preset-cards"), presetCards());

@@ -46,8 +46,6 @@ def create_run(project, library, checker):
 	answer_mode = "decisions" if decisions.is_decision_spec(config) else "json"
 	questions = None
 	if answer_mode == "decisions":
-		if input_kind == "image":
-			raise RunError("Decision models read text for now. Switch the answer back to JSON on the Task tab for image projects.")
 		questions, problems = decisions.schema_questions(schema)
 		if problems:
 			raise RunError(problems[0])
@@ -194,17 +192,27 @@ def _summary_metrics(evaluation):
 	return {k: v for k, v in evaluation.items() if k != "items"}
 
 
+def serve_folder(run_dir):
+	"""Where `llmzempic serve` logged this run's decisions: serving the run, else serving its export."""
+	for folder in (run_dir / "serve", run_dir / "export" / "serve"):
+		if (folder / "decisions.jsonl").exists():
+			return folder
+	return None
+
+
 def run_summary(run_dir):
 	spec = read_json(run_dir / "run.json", {}) or {}
 	status = read_json(run_dir / "status.json", {}) or {}
 	export_status = read_json(run_dir / "export" / "status.json", None)
 	skipped = read_json(run_dir / "skipped.json", None)
+	overlap = read_json(run_dir / "overlap.json", None)
 	checkpoints = run_dir / "checkpoints"
 	resumable = status.get("state") in ("failed", "stopped") and checkpoints.is_dir() and any(checkpoints.glob("checkpoint-*"))
 	return {
 		"id": run_dir.name,
 		"resumable": resumable,
 		"skipped": len(skipped["ids"]) if skipped else None,
+		"overlap": overlap["count"] if overlap else None,
 		"created": spec.get("created"),
 		"base_model": spec.get("base_model"),
 		"train_count": spec.get("train_count"),
@@ -212,6 +220,7 @@ def run_summary(run_dir):
 		"split": spec.get("split"),
 		"input_kind": spec.get("input_kind", "text"),
 		"answer_mode": spec.get("answer_mode", "json"),
+		"monitored": serve_folder(run_dir) is not None,
 		"datasets": spec.get("datasets") or {},
 		"model_name": model_name(spec),
 		"status": status,

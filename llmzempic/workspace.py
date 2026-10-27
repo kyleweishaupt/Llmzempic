@@ -33,8 +33,12 @@ DEFAULT_TRAINING = {
 	"quantization": "auto",
 	"accelerator": "auto",
 	"seed": 42,
-	# Decision models only: weight of the KL anchor that keeps the tuned model's language close to the base.
+	# Decision models only: weight of the KL anchor that keeps the tuned model's language close to the base,
+	# and the loss: "listwise" adds a cross-entropy over each question's options to the token loss.
 	"kl_weight": 0.1,
+	"decision_loss": "listwise",
+	# Also score the base model generating JSON on the held-out examples (slower; the usual approach's baseline).
+	"compare_generation": False,
 }
 
 PRESETS = {
@@ -43,7 +47,8 @@ PRESETS = {
 	"thorough": {"epochs": 5, "learning_rate": 1e-4, "lora_r": 32, "lora_alpha": 64},
 }
 
-DEFAULT_SETTINGS = {"hf_token": "", "llama_cpp_dir": ""}
+# The generator is any OpenAI-compatible chat endpoint used to write synthetic examples (Ollama by default).
+DEFAULT_SETTINGS = {"hf_token": "", "llama_cpp_dir": "", "generator_url": "http://localhost:11434/v1", "generator_model": "", "generator_key": ""}
 
 # One ExampleStore per project folder for the life of the process: opening one migrates and tidies.
 _stores = {}

@@ -17,7 +17,8 @@ from .workspace import SAFE_ID
 
 FORMAT = 1
 MANIFEST = "llmzempic-package.json"
-RUN_SKIP = ("checkpoints", "export", "predict")
+# serve/ holds production decision logs (with their inputs): they stay on the machine that served them.
+RUN_SKIP = ("checkpoints", "export", "predict", "serve")
 
 
 class PackageError(Exception):

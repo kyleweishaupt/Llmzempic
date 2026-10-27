@@ -59,6 +59,7 @@ function decisionBreakdown(d) {
 				h("th", { class: "num", title: "Accuracy of the base model without fine-tuning" }, "Base"),
 				h("th", { class: "num", title: "Expected calibration error after temperature scaling (lower is better)" }, "Calibration"),
 				h("th", { class: "num", title: "Brier score (lower is better)" }, "Brier"),
+				h("th", { class: "num", title: "min_confidence \"auto\": answers below this confidence are refused, which kept 90% of the remaining answers right on these examples" }, "Auto threshold"),
 			)),
 			h("tbody", {}, d.questions.map((q) => h("tr", {},
 				h("td", {}, h("code", {}, q.name), h("span", { class: "faint" }, ` ${q.type}`), q.mae !== undefined ? h("span", { class: "faint small", title: "Mean distance between the expected score and the right level" }, ` ±${fixed(q.mae, 2)} levels`) : null),
@@ -67,6 +68,7 @@ function decisionBreakdown(d) {
 				h("td", { class: "num" }, base[q.name] ? pct(base[q.name].accuracy) : "–"),
 				h("td", { class: `num ${eceTone(q.ece)}-text` }, fixed(q.ece)),
 				h("td", { class: "num" }, fixed(q.brier)),
+				h("td", { class: "num" }, q.auto ? h("span", { title: `Answers ${pct(q.auto.coverage)} of inputs` }, q.auto.min_confidence >= 1 ? "refuse all" : `${pct(q.auto.min_confidence)} (${pct(q.auto.coverage)} kept)`) : "–"),
 			))),
 		)),
 	);

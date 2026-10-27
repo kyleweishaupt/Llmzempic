@@ -21,6 +21,7 @@ from .decision_snippets import all_decision_snippets
 from .example_api import example_router
 from .package_api import package_router
 from .fileio import read_json, tail_text
+from .assist_api import assist_router
 from .image_api import image_router
 from .jobs import JobBusy, JobManager, job_paths, mark_interrupted
 from .datasets import run_resolver
@@ -29,8 +30,9 @@ from .ref_metrics import ref_scores
 from .prompts import build_system_prompt
 from .runs import (
 	GGUF_TYPES, RunError, create_run, list_export_files, model_name, prepare_export, prepare_prediction,
-	read_events, run_summary,
+	read_events, run_summary, serve_folder,
 )
+from .decision_monitor import feedback_examples, monitor_stats
 from .refs import export_contract, referenced_ids
 from .schema_tools import TEMPLATES, check_schema
 from .snippets import all_snippets
@@ -58,6 +60,14 @@ class HardwareCache:
 			if self._info is None or refresh:
 				self._info = hardware.detect()
 			return self._info
+
+
+def has_example(store, example_id):
+	try:
+		store.get(example_id)
+	except KeyError:
+		return False
+	return True
 
 
 def cross_site(request):
@@ -125,8 +135,6 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		view = {"id": project.id, "config": config}
 		if decisions.is_decision_spec(config):
 			questions, problems = decisions.schema_questions(config["schema"])
-			if config.get("input_kind") == "image":
-				problems.append("Decision models read text for now. Switch the answer back to JSON for image projects.")
 			view.update(
 				schema_errors=errors + problems,
 				system_prompt=decisions.system_prompt(config.get("instructions", "")),
@@ -162,13 +170,18 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 	@app.get("/api/settings")
 	def get_settings():
 		settings = ws.load_settings()
-		return {"hf_token_set": bool(settings.get("hf_token")), "llama_cpp_dir": settings.get("llama_cpp_dir", "")}
+		return {
+			"hf_token_set": bool(settings.get("hf_token")), "llama_cpp_dir": settings.get("llama_cpp_dir", ""),
+			"generator_url": settings.get("generator_url", ""), "generator_model": settings.get("generator_model", ""),
+			"generator_key_set": bool(settings.get("generator_key")),
+		}
 
 	@app.put("/api/settings")
 	def put_settings(payload: dict = Body(...)):
-		values = {"llama_cpp_dir": payload.get("llama_cpp_dir")}
-		if payload.get("hf_token") is not None:
-			values["hf_token"] = str(payload["hf_token"]).strip()
+		values = {k: payload.get(k) for k in ("llama_cpp_dir", "generator_url", "generator_model")}
+		for secret in ("hf_token", "generator_key"):
+			if payload.get(secret) is not None:
+				values[secret] = str(payload[secret]).strip()
 		ws.save_settings(values)
 		return get_settings()
 
@@ -259,6 +272,7 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 		return {
 			**run_summary(run_dir),
 			"skipped_examples": {"max_length": skipped["max_length"], "ids": skipped["ids"][:100]} if skipped else None,
+			"overlap_pairs": (read_json(run_dir / "overlap.json", None) or {}).get("pairs", [])[:50],
 			"events": read_events(run_dir, since),
 			"log": tail_text(job_paths("train", run_dir)[1]),
 			"export_log": tail_text(job_paths("export", run_dir)[1]),
@@ -333,6 +347,33 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 			raise HTTPException(409, str(e))
 		return {"ok": True}
 
+	@app.get("/api/projects/{project_id}/runs/{run_id}/monitor")
+	def run_monitor(project_id: str, run_id: str):
+		project = project_or_404(project_id)
+		run_dir = run_or_404(project, run_id)
+		folder = serve_folder(run_dir)
+		if folder is None:
+			return {"stats": None, "examples": 0}
+		spec = read_json(run_dir / "run.json", {}) or {}
+		labels = (read_json(run_dir / "calibration.json", {}) or {}).get("labels")
+		store = project.examples()
+		pending = [e for e in feedback_examples(folder, spec.get("questions") or []) if not has_example(store, e["id"])]
+		return {"stats": monitor_stats(folder, labels), "folder": str(folder), "examples": len(pending)}
+
+	@app.post("/api/projects/{project_id}/runs/{run_id}/monitor/examples")
+	def monitor_to_examples(project_id: str, run_id: str):
+		"""Decisions that got feedback become examples (once each), so the next run learns from them."""
+		project = project_or_404(project_id)
+		run_dir = run_or_404(project, run_id)
+		folder = serve_folder(run_dir)
+		spec = read_json(run_dir / "run.json", {}) or {}
+		store = project.examples()
+		rows = [e for e in feedback_examples(folder, spec.get("questions") or []) if not has_example(store, e["id"])] if folder else []
+		if rows:
+			added = store.add(rows)
+			checker.check_now(project, ws.library, [r["id"] for r in added])
+		return {"added": len(rows)}
+
 	@app.get("/api/projects/{project_id}/runs/{run_id}/snippets")
 	def snippets(project_id: str, run_id: str):
 		run_dir = run_or_404(project_or_404(project_id), run_id)
@@ -373,5 +414,6 @@ def create_app(workspace=None, jobs=None, hw_cache=None):
 	app.include_router(example_router(ws, project_or_404, checker))
 	app.include_router(dataset_router(ws, checker))
 	app.include_router(package_router(ws, project_or_404, project_view))
+	app.include_router(assist_router(ws, project_or_404, checker, project_view))
 	app.mount("/", WebFiles(directory=str(WEB_DIR), html=True), name="web")
 	return app
